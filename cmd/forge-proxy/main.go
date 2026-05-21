@@ -15,6 +15,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/forgeutah/forge-proxy/internal/config"
 )
 
 func main() {
@@ -24,16 +26,16 @@ func main() {
 }
 
 func run() error {
-	addr := os.Getenv("LISTEN_ADDR")
-	if addr == "" {
-		addr = ":8080"
+	cfg, err := config.Load()
+	if err != nil {
+		return err
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
 
 	srv := &http.Server{
-		Addr:              addr,
+		Addr:              cfg.ListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -43,7 +45,7 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("forge-proxy listening on %s", addr)
+		log.Printf("forge-proxy listening on %s", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
