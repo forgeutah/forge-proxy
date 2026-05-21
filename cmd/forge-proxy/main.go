@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/forgeutah/forge-proxy/internal/config"
+	"github.com/forgeutah/forge-proxy/internal/db"
 )
 
 func main() {
@@ -30,6 +31,19 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	database, err := db.Open(dbCtx, cfg.DBPath)
+	dbCancel()
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			log.Printf("forge-proxy: closing db: %v", err)
+		}
+	}()
+	log.Printf("forge-proxy: db ready at %s", database.Path())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
