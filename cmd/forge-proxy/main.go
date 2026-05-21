@@ -13,12 +13,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/forgeutah/forge-proxy/internal/auth"
 	"github.com/forgeutah/forge-proxy/internal/config"
 	"github.com/forgeutah/forge-proxy/internal/db"
+	"github.com/forgeutah/forge-proxy/internal/proxy"
 	"github.com/forgeutah/forge-proxy/internal/session"
 	"github.com/forgeutah/forge-proxy/internal/user"
 	"github.com/forgeutah/forge-proxy/internal/web"
@@ -62,21 +64,42 @@ func run() error {
 	oidcClient := auth.New(oidcCtx, cfg)
 	authH := auth.NewHandler(cfg, oidcClient, users, sessions)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", healthz)
-	authH.Register(mux)
-
-	// The login-page asset tree (U7) is served from the embedded FS. The
-	// handler runs an already-signed-in check at "/" and 302s live
-	// sessions to the default landing URL — this is the R13 contract that
-	// used to live in auth.Handler.HandleRoot, now co-located with the
-	// asset serving so the web layer owns its own routes end-to-end.
+	// authMux serves traffic destined for the auth host
+	// (cfg.AuthHost) — /healthz, the /auth/* routes, and the embedded
+	// login-page asset tree at /. The login page handler runs an
+	// already-signed-in check at "/" and 302s live sessions to the
+	// default landing URL (R13).
+	authMux := http.NewServeMux()
+	authMux.HandleFunc("GET /healthz", healthz)
+	authH.Register(authMux)
 	webH := web.NewHandler(authH, web.Config{DefaultLandingURL: cfg.DefaultLandingURL})
-	mux.Handle("GET /", webH)
+	authMux.Handle("GET /", webH)
+
+	// proxyH is the reverse-proxy hot path for every non-auth-host
+	// *.forgeutah.tech subdomain (U8). It authenticates the request,
+	// strips any client-supplied X-Forge-* headers, and injects the
+	// nine trusted X-Forge-* contract headers before forwarding to the
+	// configured upstream.
+	proxyH := proxy.New(cfg, sessions, users)
+
+	// Host-routing dispatcher: net/http.ServeMux's host patterns require
+	// each host be known literally, but the upstream hosts are runtime
+	// configuration. The dispatcher splits on the inbound Host header:
+	// requests for the auth host go to authMux (auth + web), everything
+	// else goes to the proxy. The /healthz endpoint stays scoped to the
+	// auth host — operators target it explicitly. This keeps the routing
+	// rule visible in main and avoids a second ServeMux layer.
+	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hostMatches(r.Host, cfg.AuthHost) {
+			authMux.ServeHTTP(w, r)
+			return
+		}
+		proxyH.ServeHTTP(w, r)
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           mux,
+		Handler:           rootHandler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -111,4 +134,16 @@ func run() error {
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
+}
+
+// hostMatches compares an inbound Host header against the configured auth
+// host. Host comparisons are case-insensitive per RFC 7230 §5.4 and the
+// inbound value may carry a ":port" suffix (most browsers strip the
+// default port, but tests and load-balanced setups don't always).
+func hostMatches(inbound, authHost string) bool {
+	inbound = strings.ToLower(inbound)
+	if i := strings.IndexByte(inbound, ':'); i >= 0 {
+		inbound = inbound[:i]
+	}
+	return inbound == strings.ToLower(authHost)
 }

@@ -24,3 +24,26 @@ func TestHealthz(t *testing.T) {
 		t.Fatalf("content-type = %q, want text/plain", got)
 	}
 }
+
+// TestHostMatches pins the dispatcher behaviour: case-insensitive Host
+// comparison with port stripping. The auth host wins for matching inbound
+// values; everything else falls through to the proxy.
+func TestHostMatches(t *testing.T) {
+	cases := []struct {
+		inbound  string
+		authHost string
+		want     bool
+	}{
+		{"auth.forgeutah.tech", "auth.forgeutah.tech", true},
+		{"AUTH.forgeutah.tech", "auth.forgeutah.tech", true},
+		{"auth.forgeutah.tech:8080", "auth.forgeutah.tech", true},
+		{"deuce.forgeutah.tech", "auth.forgeutah.tech", false},
+		{"auth.forgeutah.tech.evil.com", "auth.forgeutah.tech", false},
+		{"", "auth.forgeutah.tech", false},
+	}
+	for _, tc := range cases {
+		if got := hostMatches(tc.inbound, tc.authHost); got != tc.want {
+			t.Errorf("hostMatches(%q, %q) = %v, want %v", tc.inbound, tc.authHost, got, tc.want)
+		}
+	}
+}
