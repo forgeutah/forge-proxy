@@ -755,10 +755,22 @@ func TestLogout_MissingOrigin_Returns403(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /
+// Handler.IsSignedIn — the SessionChecker the web package consumes
+//
+// The GET / root route used to live here and call session.Read + Sessions.Get
+// before either redirecting to the default landing or rendering a tiny
+// HTML placeholder. U7 moved that route into internal/web (with the real
+// React card), and the Go-side already-signed-in check now lives on the
+// Handler as IsSignedIn so the web package can compose it without
+// importing internal/auth. The placeholder copy that used to live in
+// renderPlaceholder is gone — the React JSX renders the user-visible
+// strings client-side, driven by the ?error= query param.
+//
+// These three tests cover the same behaviour the four TestRoot_* tests
+// used to cover, expressed against the new interface.
 // ---------------------------------------------------------------------------
 
-func TestRoot_SignedIn_RedirectsToDefaultLanding(t *testing.T) {
+func TestIsSignedIn_LiveSession_ReturnsTrue(t *testing.T) {
 	f := newFixture(t)
 	pre, cookies := f.loginAndExtractPreAuth("https://forgeutah.tech/")
 	f.setIDToken(func() (string, int) {
@@ -772,60 +784,25 @@ func TestRoot_SignedIn_RedirectsToDefaultLanding(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(sessionCookie)
-	rec := httptest.NewRecorder()
-	f.mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", rec.Code)
-	}
-	if loc := rec.Header().Get("Location"); loc != f.cfg.DefaultLandingURL {
-		t.Fatalf("redirect = %q; want %q", loc, f.cfg.DefaultLandingURL)
+	if !f.handler.IsSignedIn(context.Background(), req) {
+		t.Fatalf("IsSignedIn = false; want true for a live session cookie")
 	}
 }
 
-func TestRoot_NoSession_RendersPlaceholder(t *testing.T) {
+func TestIsSignedIn_NoCookie_ReturnsFalse(t *testing.T) {
 	f := newFixture(t)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	f.mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "Continue with Slack") {
-		t.Fatalf("placeholder missing 'Continue with Slack' link; body=%q", body)
+	if f.handler.IsSignedIn(context.Background(), req) {
+		t.Fatalf("IsSignedIn = true; want false when no cookie present")
 	}
 }
 
-func TestRoot_NotInWorkspaceError_RendersUnauthorizedCopy(t *testing.T) {
+func TestIsSignedIn_ExpiredSession_ReturnsFalse(t *testing.T) {
 	f := newFixture(t)
-	req := httptest.NewRequest(http.MethodGet, "/?error=not_in_workspace", nil)
-	rec := httptest.NewRecorder()
-	f.mux.ServeHTTP(rec, req)
-	body := rec.Body.String()
-	if !strings.Contains(body, "Forge Utah Slack workspace") {
-		t.Fatalf("missing unauthorized copy in placeholder; body=%q", body)
-	}
-}
-
-func TestRoot_AuthFailedError_RendersTryAgain(t *testing.T) {
-	f := newFixture(t)
-	req := httptest.NewRequest(http.MethodGet, "/?error=auth_failed", nil)
-	rec := httptest.NewRecorder()
-	f.mux.ServeHTTP(rec, req)
-	body := rec.Body.String()
-	if !strings.Contains(body, "Sign-in failed.") {
-		t.Fatalf("missing auth_failed copy; body=%q", body)
-	}
-	if !strings.Contains(body, "Try again") {
-		t.Fatalf("missing retry link; body=%q", body)
-	}
-}
-
-func TestRoot_ExpiredSession_RendersPlaceholder(t *testing.T) {
-	f := newFixture(t)
-	// Manually insert a session with an expired expires_at.
+	// Manually insert a session with an expired expires_at. Expired
+	// sessions read as ErrExpired from the store; IsSignedIn must treat
+	// that the same as a missing row — the caller still sees the login
+	// card, not the default landing.
 	now := time.Now().Unix()
 	ctx := context.Background()
 	res, err := f.dbobj.Writer.ExecContext(ctx, `
@@ -847,14 +824,8 @@ func TestRoot_ExpiredSession_RendersPlaceholder(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(&http.Cookie{Name: session.CookieName, Value: expiredID})
-	rec := httptest.NewRecorder()
-	f.mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (placeholder for expired session)", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "Continue with Slack") {
-		t.Fatalf("expected placeholder body, got %q", rec.Body.String())
+	if f.handler.IsSignedIn(ctx, req) {
+		t.Fatalf("IsSignedIn = true; want false for an expired session")
 	}
 }
 

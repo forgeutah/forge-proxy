@@ -21,6 +21,7 @@ import (
 	"github.com/forgeutah/forge-proxy/internal/db"
 	"github.com/forgeutah/forge-proxy/internal/session"
 	"github.com/forgeutah/forge-proxy/internal/user"
+	"github.com/forgeutah/forge-proxy/internal/web"
 )
 
 func main() {
@@ -64,6 +65,14 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
 	authH.Register(mux)
+
+	// The login-page asset tree (U7) is served from the embedded FS. The
+	// handler runs an already-signed-in check at "/" and 302s live
+	// sessions to the default landing URL — this is the R13 contract that
+	// used to live in auth.Handler.HandleRoot, now co-located with the
+	// asset serving so the web layer owns its own routes end-to-end.
+	webH := web.NewHandler(authH, web.Config{DefaultLandingURL: cfg.DefaultLandingURL})
+	mux.Handle("GET /", webH)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,

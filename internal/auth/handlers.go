@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"log"
@@ -42,15 +43,35 @@ func NewHandler(cfg *config.Config, o *OIDC, users *user.Store, sessions *sessio
 	return &Handler{Cfg: cfg, OIDC: o, Users: users, Sessions: sessions}
 }
 
-// Register wires the four U6 routes onto the supplied mux. The proxy host
-// routing (U8) will eventually differentiate auth-host paths from
-// upstream-app paths, but for U6 every route serves regardless of host —
-// the binary listens on a single port and the mux dispatches by path.
+// Register wires the three /auth/* routes onto the supplied mux. The
+// already-signed-in check at GET /{$} is owned by internal/web (U7) —
+// keeping the root route there lets the web layer own asset serving and
+// the session-redirect compose cleanly without circular imports.
+//
+// The proxy host routing (U8) will eventually differentiate auth-host
+// paths from upstream-app paths, but for U6 every route serves regardless
+// of host — the binary listens on a single port and the mux dispatches
+// by path.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/login", h.HandleLogin)
 	mux.HandleFunc("GET /auth/callback", h.HandleCallback)
 	mux.HandleFunc("POST /auth/logout", h.HandleLogout)
-	mux.HandleFunc("GET /{$}", h.HandleRoot)
+}
+
+// IsSignedIn satisfies the web.SessionChecker interface so the embedded
+// asset handler can 302 already-signed-in callers to the default landing
+// URL before serving the login card. The check is a session lookup
+// against the store; an expired or missing row reports "not signed in".
+func (h *Handler) IsSignedIn(ctx context.Context, r *http.Request) bool {
+	id, ok := session.Read(r)
+	if !ok {
+		return false
+	}
+	sess, err := h.Sessions.Get(ctx, id)
+	if err != nil || sess == nil {
+		return false
+	}
+	return true
 }
 
 // HandleLogin (GET /auth/login) is the entry point for a sign-in. It
@@ -253,21 +274,6 @@ func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-// HandleRoot serves GET / on the auth host. A live session 302s to the
-// configured default landing URL (R13's already-signed-in state). Without
-// a session, we render a tiny placeholder login page that links to
-// /auth/login. U7 replaces this with the real React card; the placeholder
-// only needs enough for redirect-to-login flows to round-trip in tests.
-func (h *Handler) HandleRoot(w http.ResponseWriter, r *http.Request) {
-	if id, ok := session.Read(r); ok {
-		if sess, err := h.Sessions.Get(r.Context(), id); err == nil && sess != nil {
-			http.Redirect(w, r, h.Cfg.DefaultLandingURL, http.StatusFound)
-			return
-		}
-	}
-	renderPlaceholder(w, r.URL.Query().Get("error"))
-}
-
 // errorURL builds the redirect URL for an error branch. Always relative to
 // the auth host root so the user lands on the login page.
 func (h *Handler) errorURL(code string) string {
@@ -334,36 +340,4 @@ func clientIP(r *http.Request) string {
 	}
 	return strings.Trim(addr, "[]")
 }
-
-// renderPlaceholder writes a tiny HTML login page. U7 owns the real React
-// card; this exists only so /auth/login-driven redirects can land
-// somewhere coherent during U6 development and tests.
-func renderPlaceholder(w http.ResponseWriter, errorCode string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	switch errorCode {
-	case errorQueryAuthFailed:
-		fmt.Fprintf(w, placeholderHTML, "Sign-in failed.", `<a href="/auth/login">Try again</a>`)
-	case errorQueryNotInWorkspace:
-		fmt.Fprintf(w, placeholderHTML,
-			"You're not a member of the Forge Utah Slack workspace.",
-			`Switch to forgeutah.slack.com and <a href="/auth/login">try again</a>.`)
-	default:
-		fmt.Fprintf(w, placeholderHTML, "Forge Utah sign-in.", `<a href="/auth/login">Continue with Slack</a>`)
-	}
-}
-
-// placeholderHTML is a deliberately minimal template — Go fmt verbs, no
-// templating engine, no styling. U7 replaces this file with the embedded
-// React assets.
-const placeholderHTML = `<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Forge Utah</title></head>
-<body>
-<h1>Forge Utah</h1>
-<p>%s</p>
-<p>%s</p>
-</body>
-</html>
-`
 
