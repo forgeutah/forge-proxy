@@ -1,0 +1,336 @@
+/* =====================================================================
+   FORGE UTAH — Colors & Type
+   Terminal / 8-bit themed design tokens. Dark mode primary.
+   Brand: red flame (#C04058) + gray cog (#A8A8A8), monospace-forward.
+   ===================================================================== */
+
+/* ---------- Webfonts (fall back gracefully if not loaded) ---------- */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&family=VT323&family=Press+Start+2P&family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+:root {
+  /* ============================================================
+     PALETTE — Base tokens. Don't reference these in components;
+     use the semantic tokens below.
+     ============================================================ */
+
+  /* Brand */
+  --forge-flame:        #C04058;   /* logo red / primary brand */
+  --forge-flame-bright: #E0445F;   /* glow / hover */
+  --forge-flame-deep:   #8A2D3F;   /* pressed / shadow */
+  --forge-ember:        #F26B7A;   /* highlight tint */
+  --forge-cog:          #A8A8A8;   /* logo gray / secondary brand */
+  --forge-cog-dark:     #6B6B6B;
+  --forge-cog-light:    #D0D0D0;
+
+  /* Neutrals — terminal-dark, near-black with cool tint */
+  --ink-0:  #07090C;    /* deepest bg (canvas) */
+  --ink-1:  #0B0E13;    /* page bg */
+  --ink-2:  #11151C;    /* card bg */
+  --ink-3:  #181D26;    /* raised surface */
+  --ink-4:  #232936;    /* border / divider */
+  --ink-5:  #2E3645;    /* hovered border */
+  --ink-6:  #404A5C;    /* muted line */
+  --ink-7:  #6B7689;    /* dim text */
+  --ink-8:  #97A1B3;    /* secondary text */
+  --ink-9:  #C8CFDB;    /* primary text */
+  --ink-10: #E8ECF2;    /* high-contrast text */
+  --ink-11: #FFFFFF;    /* pure white — sparingly */
+
+  /* Terminal accents */
+  --term-green:  #4ADE80;   /* success / online */
+  --term-amber:  #FBBF24;   /* warning / building */
+  --term-cyan:   #67E8F9;   /* info / link hover */
+  --term-magenta:#D946EF;   /* rare highlight */
+  --term-error:  #F87171;   /* destructive */
+
+  /* ============================================================
+     SEMANTIC — use these in components.
+     ============================================================ */
+
+  /* Surfaces */
+  --bg:           var(--ink-1);
+  --bg-canvas:    var(--ink-0);
+  --bg-surface:   var(--ink-2);
+  --bg-raised:    var(--ink-3);
+  --bg-inset:     var(--ink-0);
+  --bg-hover:     var(--ink-3);
+
+  /* Foregrounds */
+  --fg:           var(--ink-9);    /* default body text */
+  --fg-strong:    var(--ink-10);
+  --fg-max:       var(--ink-11);
+  --fg-muted:     var(--ink-8);
+  --fg-dim:       var(--ink-7);
+  --fg-disabled:  var(--ink-6);
+
+  /* Lines */
+  --border:        var(--ink-4);
+  --border-strong: var(--ink-5);
+  --border-muted:  var(--ink-3);
+
+  /* Accents */
+  --accent:        var(--forge-flame);
+  --accent-hover:  var(--forge-flame-bright);
+  --accent-press:  var(--forge-flame-deep);
+  --accent-on:     #FFFFFF;        /* text on flame fills */
+  --accent-glow:   rgba(224, 68, 95, 0.35);
+
+  /* Status */
+  --success: var(--term-green);
+  --warning: var(--term-amber);
+  --info:    var(--term-cyan);
+  --error:   var(--term-error);
+
+  /* Selection */
+  --selection-bg: rgba(192, 64, 88, 0.35);
+  --selection-fg: var(--ink-11);
+
+  /* ============================================================
+     TYPE — three families: mono primary, sans body, pixel display
+     ============================================================ */
+  --font-mono:    "JetBrains Mono", "IBM Plex Mono", "Berkeley Mono",
+                  ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+                  Consolas, "Liberation Mono", monospace;
+  --font-sans:    "Inter", system-ui, -apple-system, "Segoe UI",
+                  Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-pixel:   "Press Start 2P", "VT323", var(--font-mono);
+  --font-crt:     "VT323", var(--font-mono);   /* tall retro terminal */
+
+  /* Weights */
+  --weight-regular:  400;
+  --weight-medium:   500;
+  --weight-semibold: 600;
+  --weight-bold:     700;
+  --weight-black:    800;
+
+  /* Scale — mono-friendly stepping */
+  --text-2xs: 11px;
+  --text-xs:  12px;
+  --text-sm:  13px;
+  --text-md:  14px;   /* default mono body */
+  --text-base:15px;   /* default sans body */
+  --text-lg:  17px;
+  --text-xl:  20px;
+  --text-2xl: 24px;
+  --text-3xl: 30px;
+  --text-4xl: 38px;
+  --text-5xl: 48px;
+  --text-6xl: 64px;
+  --text-7xl: 84px;
+  --text-display: 112px;
+
+  --leading-tight:   1.15;
+  --leading-snug:    1.3;
+  --leading-normal:  1.5;
+  --leading-loose:   1.7;
+
+  --tracking-tight:  -0.02em;
+  --tracking-normal: 0;
+  --tracking-wide:   0.04em;
+  --tracking-wider:  0.12em;     /* eyebrow caps */
+  --tracking-mega:   0.22em;     /* "TERMINAL >" labels */
+
+  /* ============================================================
+     SPACE / RADII / SHADOWS — pixel-grid based (4px step)
+     ============================================================ */
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  20px;
+  --space-6:  24px;
+  --space-8:  32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+  --space-24: 96px;
+
+  /* Corners — square/pixel-art forward; minimal rounding */
+  --radius-0: 0;
+  --radius-1: 2px;
+  --radius-2: 4px;
+  --radius-3: 6px;
+  --radius-pill: 999px;
+
+  /* Borders */
+  --border-width: 1px;
+  --border-thick: 2px;
+
+  /* Shadows — used sparingly; we prefer 1px borders & glows */
+  --shadow-0: none;
+  --shadow-1: 0 1px 0 0 rgba(255,255,255,0.04) inset,
+              0 1px 2px 0 rgba(0,0,0,0.6);
+  --shadow-2: 0 4px 12px -2px rgba(0,0,0,0.55),
+              0 1px 0 0 rgba(255,255,255,0.04) inset;
+  --shadow-3: 0 12px 32px -6px rgba(0,0,0,0.7),
+              0 1px 0 0 rgba(255,255,255,0.05) inset;
+
+  /* Glow — the signature flame accent */
+  --glow-flame:    0 0 0 1px var(--accent),
+                   0 0 24px -4px var(--accent-glow);
+  --glow-flame-sm: 0 0 0 1px var(--accent),
+                   0 0 10px -2px var(--accent-glow);
+  --glow-cyan:     0 0 0 1px var(--info),
+                   0 0 16px -4px rgba(103, 232, 249, 0.4);
+
+  /* Motion */
+  --ease-out:     cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in-out:  cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-snappy:  cubic-bezier(0.3, 0.7, 0.1, 1);
+  --dur-fast:     120ms;
+  --dur-base:     180ms;
+  --dur-slow:     280ms;
+}
+
+/* =====================================================================
+   SEMANTIC TYPE STYLES — assign with @apply-like utility classes
+   ===================================================================== */
+.fu-display {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-black);
+  font-size: var(--text-display);
+  line-height: 0.95;
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-max);
+}
+.fu-h1 {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-6xl);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-max);
+}
+.fu-h2 {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-4xl);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-strong);
+}
+.fu-h3 {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-2xl);
+  line-height: var(--leading-snug);
+  color: var(--fg-strong);
+}
+.fu-h4 {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-lg);
+  line-height: var(--leading-snug);
+  color: var(--fg-strong);
+}
+.fu-body {
+  font-family: var(--font-sans);
+  font-weight: var(--weight-regular);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--fg);
+}
+.fu-body-sm {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--fg-muted);
+}
+.fu-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+  color: var(--fg);
+}
+.fu-code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  padding: 2px 6px;
+  border-radius: var(--radius-1);
+  color: var(--term-cyan);
+}
+.fu-eyebrow {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-mega);
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.fu-label {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-medium);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.fu-caption {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--fg-dim);
+}
+.fu-prompt {
+  font-family: var(--font-mono);
+  font-size: var(--text-md);
+  color: var(--fg);
+}
+.fu-prompt::before {
+  content: "$ ";
+  color: var(--accent);
+  font-weight: var(--weight-bold);
+}
+.fu-crt {
+  font-family: var(--font-crt);
+  font-size: var(--text-3xl);
+  line-height: 1;
+  color: var(--term-green);
+  text-shadow: 0 0 8px currentColor;
+}
+
+/* =====================================================================
+   BASE — opinionated reset for any page that loads this stylesheet
+   ===================================================================== */
+.fu-root,
+.fu-root * { box-sizing: border-box; }
+.fu-root {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+.fu-root ::selection {
+  background: var(--selection-bg);
+  color: var(--selection-fg);
+}
+
+/* Subtle scanline texture — opt in by adding .fu-scanlines */
+.fu-scanlines {
+  position: relative;
+}
+.fu-scanlines::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent 0 2px,
+    rgba(255, 255, 255, 0.015) 2px 3px
+  );
+  z-index: 1;
+}
+
+/* Dot grid background — opt in by adding .fu-dotgrid */
+.fu-dotgrid {
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 0);
+  background-size: 24px 24px;
+}

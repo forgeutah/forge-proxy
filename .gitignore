@@ -1,0 +1,23 @@
+# Binary
+/forge-proxy
+
+# Local SQLite state
+*.db
+*.db-wal
+*.db-shm
+
+# Local env / secrets
+.env
+.env.local
+litestream.yml.local
+
+# Go build cache
+/dist/
+/tmp/
+
+# IDE noise
+.vscode/
+.idea/
+
+# OS noise
+.DS_Store
