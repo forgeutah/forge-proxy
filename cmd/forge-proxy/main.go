@@ -16,8 +16,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/forgeutah/forge-proxy/internal/auth"
 	"github.com/forgeutah/forge-proxy/internal/config"
 	"github.com/forgeutah/forge-proxy/internal/db"
+	"github.com/forgeutah/forge-proxy/internal/session"
+	"github.com/forgeutah/forge-proxy/internal/user"
 )
 
 func main() {
@@ -45,8 +48,22 @@ func run() error {
 	}()
 	log.Printf("forge-proxy: db ready at %s", database.Path())
 
+	// Build the auth stack. The OIDC client kicks off a background JWKS
+	// fetch immediately; the binary stays up even if Slack is unreachable.
+	users := user.New(database, nil)
+	sessions := session.New(database, session.Options{
+		Lifetime:     cfg.SessionLifetime,
+		IdleTimeout:  cfg.SessionIdleTimeout,
+		CookieDomain: cfg.CookieDomain,
+	})
+	oidcCtx, oidcStop := context.WithCancel(context.Background())
+	defer oidcStop()
+	oidcClient := auth.New(oidcCtx, cfg)
+	authH := auth.NewHandler(cfg, oidcClient, users, sessions)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
+	authH.Register(mux)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,

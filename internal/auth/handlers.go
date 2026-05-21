@@ -1,0 +1,369 @@
+package auth
+
+import (
+	"crypto/subtle"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+
+	"github.com/coreos/go-oidc/v3/oidc"
+	"golang.org/x/oauth2"
+
+	"github.com/forgeutah/forge-proxy/internal/config"
+	"github.com/forgeutah/forge-proxy/internal/session"
+	"github.com/forgeutah/forge-proxy/internal/user"
+)
+
+// errorQueryAuthFailed is the user-visible code for the generic "OAuth
+// round-trip failed somewhere" terminal state. U7's login page reads this
+// query parameter and renders the appropriate copy.
+const errorQueryAuthFailed = "auth_failed"
+
+// errorQueryNotInWorkspace is the F3 unauthorized branch — the user signed
+// into Slack but with a workspace other than the configured Forge Utah one.
+const errorQueryNotInWorkspace = "not_in_workspace"
+
+// Handler bundles the U6 routes and their dependencies. The struct is
+// created once at startup in cmd/forge-proxy/main.go and serves all four
+// routes for the lifetime of the process. None of its fields are mutated
+// after construction, so the zero-lock design is safe for concurrent use.
+type Handler struct {
+	Cfg      *config.Config
+	OIDC     *OIDC
+	Users    *user.Store
+	Sessions *session.Store
+}
+
+// NewHandler is the convenience constructor. Keeping the dependencies on
+// the struct (rather than threading them through every method) makes the
+// route registration in main.go a one-liner per route.
+func NewHandler(cfg *config.Config, o *OIDC, users *user.Store, sessions *session.Store) *Handler {
+	return &Handler{Cfg: cfg, OIDC: o, Users: users, Sessions: sessions}
+}
+
+// Register wires the four U6 routes onto the supplied mux. The proxy host
+// routing (U8) will eventually differentiate auth-host paths from
+// upstream-app paths, but for U6 every route serves regardless of host —
+// the binary listens on a single port and the mux dispatches by path.
+func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /auth/login", h.HandleLogin)
+	mux.HandleFunc("GET /auth/callback", h.HandleCallback)
+	mux.HandleFunc("POST /auth/logout", h.HandleLogout)
+	mux.HandleFunc("GET /{$}", h.HandleRoot)
+}
+
+// HandleLogin (GET /auth/login) is the entry point for a sign-in. It
+// validates the requested return_to, mints fresh state and nonce values,
+// writes the pre-auth cookie, and 302s the user to Slack's authorize
+// endpoint.
+//
+// The state/nonce/return_to triple is bound to *this* browser session
+// through the __Host- pre-auth cookie — the Outline-CVE defence. Without
+// the cookie, an attacker who intercepts the state cannot complete the
+// callback because the cookie won't be in their jar.
+func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
+	returnTo := h.resolveReturnTo(r.URL.Query().Get("return_to"))
+
+	payload, err := NewPreAuth(returnTo)
+	if err != nil {
+		log.Printf("auth/login: generating pre-auth tokens: %v", err)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+	if err := SetPreAuth(w, payload); err != nil {
+		log.Printf("auth/login: setting pre-auth cookie: %v", err)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	authURL := h.OIDC.OAuth.AuthCodeURL(
+		payload.State,
+		oauth2.SetAuthURLParam("nonce", payload.Nonce),
+		oauth2.SetAuthURLParam("team", h.Cfg.SlackTeamID),
+	)
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// idTokenClaims is the struct go-oidc populates from the verified ID
+// token. We declare the namespaced Slack claims with their exact JSON keys
+// (the URLs) so the field can be populated by IDToken.Claims().
+type idTokenClaims struct {
+	Subject     string `json:"sub"`
+	Email       string `json:"email"`
+	Name        string `json:"name"`
+	Picture     string `json:"picture"`
+	Nonce       string `json:"nonce"`
+	SlackTeamID string `json:"https://slack.com/team_id"`
+	SlackUserID string `json:"https://slack.com/user_id"`
+}
+
+// HandleCallback (GET /auth/callback) finishes the OAuth round-trip. The
+// canonical ordering is critical:
+//
+//  1. Read the pre-auth cookie, then immediately write a deletion cookie —
+//     this enforces single-use state regardless of what happens next.
+//  2. Validate state against the cookie via constant-time compare.
+//  3. Check the OIDC verifier is ready; if not, bail early.
+//  4. Exchange the code for a token.
+//  5. Verify the ID token signature, issuer, audience, exp/iat (the go-oidc
+//     verifier covers these). The SupportedSigningAlgs pin blocks the
+//     HS256-with-public-key algorithm-confusion attack.
+//  6. Parse claims; constant-time compare nonce and team_id.
+//  7. Upsert the user row, create a session row, set the session cookie,
+//     redirect to the validated return_to.
+//
+// Every failure path renders ?error=auth_failed (or
+// ?error=not_in_workspace for the team mismatch) and stops. No partial
+// state ever leaves the handler.
+func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
+	// Step 1: read pre-auth, then immediately delete. Delete-first
+	// guarantees single-use even if the rest of the handler crashes.
+	pre, preErr := ReadPreAuth(r)
+	ClearPreAuth(w)
+	if preErr != nil {
+		log.Printf("auth/callback: pre-auth read: %v", preErr)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	// Step 2: state constant-time compare.
+	queryState := r.URL.Query().Get("state")
+	if subtle.ConstantTimeCompare([]byte(queryState), []byte(pre.State)) != 1 {
+		log.Printf("auth/callback: state mismatch")
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	// Step 3: verifier readiness.
+	verifier := h.OIDC.Verifier()
+	if verifier == nil {
+		log.Printf("auth/callback: OIDC verifier not ready")
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	// Step 4: code exchange. We use the request's context so a client
+	// disconnect cancels the upstream Slack call instead of leaving it
+	// dangling.
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		log.Printf("auth/callback: missing code")
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+	token, err := h.OIDC.OAuth.Exchange(r.Context(), code)
+	if err != nil {
+		log.Printf("auth/callback: token exchange: %v", err)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	// Step 5: extract and verify the ID token. The Extra field returns an
+	// untyped any, so we type-assert to string.
+	rawIDToken, _ := token.Extra(idTokenExtraField).(string)
+	if rawIDToken == "" {
+		log.Printf("auth/callback: token response missing id_token")
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+	idToken, err := verifier.Verify(r.Context(), rawIDToken)
+	if err != nil {
+		log.Printf("auth/callback: id_token verify: %v", err)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	// Step 6: parse claims and verify nonce + team.
+	claims, err := parseClaims(idToken)
+	if err != nil {
+		log.Printf("auth/callback: claims parse: %v", err)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(pre.Nonce)) != 1 {
+		log.Printf("auth/callback: nonce mismatch")
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(claims.SlackTeamID), []byte(h.Cfg.SlackTeamID)) != 1 {
+		// F3 / R3 / R13: user is signed into Slack but with the wrong
+		// workspace. Render the "not in workspace" state — no session.
+		log.Printf("auth/callback: workspace mismatch (claim=%q want=%q)", claims.SlackTeamID, h.Cfg.SlackTeamID)
+		http.Redirect(w, r, h.errorURL(errorQueryNotInWorkspace), http.StatusFound)
+		return
+	}
+
+	// Step 7: upsert + session. Slack OIDC puts the per-workspace user ID
+	// in `sub` (the namespaced https://slack.com/user_id claim is also
+	// present but the spec mandates sub).
+	slackUserID := claims.SlackUserID
+	if slackUserID == "" {
+		slackUserID = claims.Subject
+	}
+	u, err := h.Users.UpsertFromOIDC(r.Context(), user.OIDCClaims{
+		SlackUserID: slackUserID,
+		SlackTeamID: claims.SlackTeamID,
+		Email:       claims.Email,
+		Name:        claims.Name,
+		AvatarURL:   claims.Picture,
+	})
+	if err != nil {
+		log.Printf("auth/callback: user upsert: %v", err)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	userAgent := r.Header.Get("User-Agent")
+	ip := clientIP(r)
+	sess, err := h.Sessions.Create(r.Context(), u.ID, userAgent, ip)
+	if err != nil {
+		log.Printf("auth/callback: session create: %v", err)
+		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
+		return
+	}
+
+	session.Set(w, sess.ID, sess.ExpiresAt, h.Cfg.CookieDomain)
+	http.Redirect(w, r, pre.ReturnTo, http.StatusFound)
+}
+
+// HandleLogout (POST /auth/logout) ends the current session. CSRF defence
+// is the Origin-header check; SameSite=Lax on the session cookie is
+// belt-and-braces. We deliberately do NOT thread a per-session CSRF token
+// through upstream apps — the cost (token plumbing per app) is bigger than
+// the residual risk (sign-out CSRF is low-impact: annoyance, not
+// compromise).
+func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	expected := "https://" + h.Cfg.AuthHost
+	if origin == "" || origin != expected {
+		log.Printf("auth/logout: origin mismatch (got=%q want=%q)", origin, expected)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if id, ok := session.Read(r); ok {
+		if err := h.Sessions.Delete(r.Context(), id); err != nil {
+			// Failing to delete is logged but the user-visible behaviour is
+			// still "you're signed out" — clear the cookie regardless.
+			log.Printf("auth/logout: session delete: %v", err)
+		}
+	}
+	session.Clear(w, h.Cfg.CookieDomain)
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// HandleRoot serves GET / on the auth host. A live session 302s to the
+// configured default landing URL (R13's already-signed-in state). Without
+// a session, we render a tiny placeholder login page that links to
+// /auth/login. U7 replaces this with the real React card; the placeholder
+// only needs enough for redirect-to-login flows to round-trip in tests.
+func (h *Handler) HandleRoot(w http.ResponseWriter, r *http.Request) {
+	if id, ok := session.Read(r); ok {
+		if sess, err := h.Sessions.Get(r.Context(), id); err == nil && sess != nil {
+			http.Redirect(w, r, h.Cfg.DefaultLandingURL, http.StatusFound)
+			return
+		}
+	}
+	renderPlaceholder(w, r.URL.Query().Get("error"))
+}
+
+// errorURL builds the redirect URL for an error branch. Always relative to
+// the auth host root so the user lands on the login page.
+func (h *Handler) errorURL(code string) string {
+	return "/?error=" + code
+}
+
+// resolveReturnTo runs the strict validator against the supplied raw value
+// and falls back to the configured default landing URL on any failure.
+// Callers never see the raw input again — only the validator's
+// reconstructed string.
+func (h *Handler) resolveReturnTo(raw string) string {
+	if v, err := Validate(raw, h.Cfg.BaseDomain); err == nil {
+		return v
+	}
+	if h.Cfg.DefaultLandingURL != "" {
+		return h.Cfg.DefaultLandingURL
+	}
+	return "https://" + h.Cfg.AuthHost + "/"
+}
+
+// parseClaims runs idToken.Claims into our typed struct. We surface a
+// distinct error so the handler can log it without leaking the underlying
+// JSON structure.
+func parseClaims(idToken *oidc.IDToken) (*idTokenClaims, error) {
+	var c idTokenClaims
+	if err := idToken.Claims(&c); err != nil {
+		return nil, fmt.Errorf("claims decode: %w", err)
+	}
+	// Some providers serialise the namespaced claims into a separate map
+	// rather than as siblings of the standard claims. Slack puts them at
+	// the top level, so the json tags above pick them up; but to be robust
+	// against changes we also fall back to a raw map lookup if the typed
+	// fields came back empty.
+	if c.SlackTeamID == "" || c.SlackUserID == "" {
+		var raw map[string]any
+		if err := idToken.Claims(&raw); err == nil {
+			if c.SlackTeamID == "" {
+				if v, ok := raw[slackTeamClaim].(string); ok {
+					c.SlackTeamID = v
+				}
+			}
+			if c.SlackUserID == "" {
+				if v, ok := raw[slackUserClaim].(string); ok {
+					c.SlackUserID = v
+				}
+			}
+		}
+	}
+	return &c, nil
+}
+
+// clientIP returns a best-effort client IP for session-row recording. We
+// don't rely on this for any security decision (sessions aren't IP-bound)
+// — it's logged so admins can see "this session was created from this IP"
+// when investigating an incident.
+func clientIP(r *http.Request) string {
+	// X-Forwarded-For is set by trusted upstream layers in production
+	// (Cloudflare or the exe.dev load balancer) but is the user's input
+	// otherwise. For a v1 single-VM deploy with public IP we don't trust
+	// it — use the remote address.
+	addr := r.RemoteAddr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		addr = addr[:i]
+	}
+	return strings.Trim(addr, "[]")
+}
+
+// renderPlaceholder writes a tiny HTML login page. U7 owns the real React
+// card; this exists only so /auth/login-driven redirects can land
+// somewhere coherent during U6 development and tests.
+func renderPlaceholder(w http.ResponseWriter, errorCode string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	switch errorCode {
+	case errorQueryAuthFailed:
+		fmt.Fprintf(w, placeholderHTML, "Sign-in failed.", `<a href="/auth/login">Try again</a>`)
+	case errorQueryNotInWorkspace:
+		fmt.Fprintf(w, placeholderHTML,
+			"You're not a member of the Forge Utah Slack workspace.",
+			`Switch to forgeutah.slack.com and <a href="/auth/login">try again</a>.`)
+	default:
+		fmt.Fprintf(w, placeholderHTML, "Forge Utah sign-in.", `<a href="/auth/login">Continue with Slack</a>`)
+	}
+}
+
+// placeholderHTML is a deliberately minimal template — Go fmt verbs, no
+// templating engine, no styling. U7 replaces this file with the embedded
+// React assets.
+const placeholderHTML = `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Forge Utah</title></head>
+<body>
+<h1>Forge Utah</h1>
+<p>%s</p>
+<p>%s</p>
+</body>
+</html>
+`
+
