@@ -59,6 +59,12 @@ type Proxy struct {
 	sessions     SessionStore
 	users        UserStore
 	reverseProxy *httputil.ReverseProxy
+
+	// loginURLPrefix is the precomputed "https://<AuthHost>/auth/login?return_to="
+	// prefix. The inbound URL is appended via url.QueryEscape on each unauth
+	// request — most authenticated traffic doesn't hit this path, but the
+	// computation is one-shot at startup either way.
+	loginURLPrefix string
 }
 
 // New constructs a Proxy with the supplied dependencies. The ReverseProxy
@@ -68,10 +74,11 @@ type Proxy struct {
 // responses flush immediately on every Write.
 func New(cfg *config.Config, sessions SessionStore, users UserStore) *Proxy {
 	p := &Proxy{
-		cfg:      cfg,
-		hosts:    NewHostMap(cfg.UpstreamMap),
-		sessions: sessions,
-		users:    users,
+		cfg:            cfg,
+		hosts:          NewHostMap(cfg.UpstreamMap),
+		sessions:       sessions,
+		users:          users,
+		loginURLPrefix: "https://" + cfg.AuthHost + "/auth/login?return_to=",
 	}
 
 	p.reverseProxy = &httputil.ReverseProxy{
@@ -215,7 +222,7 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 // the exact original URL.
 func (p *Proxy) redirectToLogin(w http.ResponseWriter, r *http.Request, reason string) {
 	inbound := "https://" + r.Host + r.URL.RequestURI()
-	loginURL := "https://" + p.cfg.AuthHost + "/auth/login?return_to=" + url.QueryEscape(inbound)
+	loginURL := p.loginURLPrefix + url.QueryEscape(inbound)
 	httplog.FromContext(r.Context()).Info("proxy: redirecting to login",
 		"reason", reason, "inbound", inbound, "login_url", loginURL)
 	http.Redirect(w, r, loginURL, http.StatusFound)

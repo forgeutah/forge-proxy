@@ -42,20 +42,6 @@ const (
 	forgeHeaderPrefix = "X-Forge-"
 )
 
-// trustedHeaderNames lists the nine outbound headers in the order the
-// inject step writes them. Kept in code (not a config table) so a future
-// rename is a single edit and the compiler catches drift.
-var trustedHeaderNames = []string{
-	headerProxySecret,
-	headerContractVersion,
-	headerUserID,
-	headerEmail,
-	headerName,
-	headerAvatar,
-	headerRoles,
-	headerSlackUserID,
-	headerSlackTeamID,
-}
 
 // stripForgeHeaders is the three-layer strip described in the plan's U8
 // approach. It runs BEFORE injectForgeHeaders so the trusted Set calls
@@ -136,7 +122,8 @@ func stripForgeHeaders(out *http.Request) {
 }
 
 // injectForgeHeaders writes the nine trusted X-Forge-* headers, performing a
-// Del-before-Set on each (Layer 3). The Set order matches trustedHeaderNames.
+// Del-before-Set on each (Layer 3). The Set order matches the pairs slice
+// declared below.
 //
 // The Name field is potentially non-ASCII (Slack display names can include
 // emoji and other characters above 0x7f). HTTP/1.1 header values are
@@ -147,25 +134,28 @@ func stripForgeHeaders(out *http.Request) {
 // always ASCII-safe and the upstream contract is portable. Pure-ASCII names
 // pass through unchanged.
 func injectForgeHeaders(out *http.Request, proxySecret string, u *user.User) {
-	values := map[string]string{
-		headerProxySecret:     proxySecret,
-		headerContractVersion: contractVersion,
-		headerUserID:          strconv.FormatInt(u.ID, 10),
-		headerEmail:           u.Email,
-		headerName:            encodeDisplayName(u.Name),
-		headerAvatar:          u.AvatarURL,
-		headerRoles:           strings.Join(u.Roles, ","),
-		headerSlackUserID:     u.SlackUserID,
-		headerSlackTeamID:     u.SlackTeamID,
+	// Pairs are listed in the wire-order they're emitted. A single ordered
+	// list (rather than a parallel slice+map) means a future header addition
+	// is a one-line edit; the compiler still catches a typo'd header constant.
+	pairs := [...]struct{ name, value string }{
+		{headerProxySecret, proxySecret},
+		{headerContractVersion, contractVersion},
+		{headerUserID, strconv.FormatInt(u.ID, 10)},
+		{headerEmail, u.Email},
+		{headerName, encodeDisplayName(u.Name)},
+		{headerAvatar, u.AvatarURL},
+		{headerRoles, strings.Join(u.Roles, ",")},
+		{headerSlackUserID, u.SlackUserID},
+		{headerSlackTeamID, u.SlackTeamID},
 	}
 
-	for _, name := range trustedHeaderNames {
+	for _, p := range pairs {
 		// Layer 3 of the strip: defense-in-depth Del immediately before Set.
 		// http.Header is map[string][]string; if a sibling code path ever
 		// landed an X-Forge-* slice with multiple entries, a bare Set would
 		// overwrite only the first index. Del clears the slice cleanly.
-		out.Header.Del(name)
-		out.Header.Set(name, values[name])
+		out.Header.Del(p.name)
+		out.Header.Set(p.name, p.value)
 	}
 }
 

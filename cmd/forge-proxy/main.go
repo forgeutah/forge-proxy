@@ -134,8 +134,12 @@ func run() error {
 	// requests for the auth host go to authMux (auth + web), everything
 	// else goes to the proxy. The /healthz endpoint stays scoped to the
 	// auth host — operators target it explicitly.
+	//
+	// Both branches share proxy.NormalizeHost so the auth-host comparison
+	// applies the same lowercase + port-strip rule the upstream lookup uses.
+	authHostNorm := proxy.NormalizeHost(cfg.AuthHost)
 	dispatcher := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if hostMatches(r.Host, cfg.AuthHost) {
+		if proxy.NormalizeHost(r.Host) == authHostNorm {
 			authMux.ServeHTTP(w, r)
 			return
 		}
@@ -275,13 +279,9 @@ func readyzHandler(writer, reader pinger, oidcClient readinessOIDC, sweeper read
 }
 
 // hostMatches compares an inbound Host header against the configured auth
-// host. Host comparisons are case-insensitive per RFC 7230 §5.4 and the
-// inbound value may carry a ":port" suffix (most browsers strip the
-// default port, but tests and load-balanced setups don't always).
+// host using proxy.NormalizeHost so the dispatcher and the upstream lookup
+// share a single normalisation rule. Kept as a thin wrapper because the
+// existing test suite covers the auth-host edge cases here.
 func hostMatches(inbound, authHost string) bool {
-	inbound = strings.ToLower(inbound)
-	if i := strings.IndexByte(inbound, ':'); i >= 0 {
-		inbound = inbound[:i]
-	}
-	return inbound == strings.ToLower(authHost)
+	return proxy.NormalizeHost(inbound) == proxy.NormalizeHost(authHost)
 }

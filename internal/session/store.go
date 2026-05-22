@@ -192,22 +192,41 @@ func (s *Store) Get(ctx context.Context, id string) (*Session, error) {
 func (s *Store) Touch(ctx context.Context, id string) error {
 	now := s.opts.Now().UTC()
 
-	// Read inside the writer transaction so the throttle decision and the
-	// update are atomic — otherwise two concurrent Touch calls could both
-	// observe a stale last_seen_at and both write.
+	// Fast path: read last_seen_at via the reader pool. The 60s throttle
+	// exists to keep chatty clients out of the writer pool entirely, so
+	// the throttle check must precede the writer acquisition. A stale read
+	// is harmless — the slow path below re-validates inside the writer
+	// transaction so two concurrent Touch calls can't both write.
+	var lastSeenAtSec int64
+	err := s.db.Reader.QueryRowContext(ctx, `
+		SELECT last_seen_at FROM sessions WHERE id = ?
+	`, id).Scan(&lastSeenAtSec)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Touch on a nonexistent ID is a no-op. The HTTP layer rejects
+		// the request via Get's ErrNotFound; we don't surface the same
+		// failure twice.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("session: touch pre-check: %w", err)
+	}
+	lastSeen := time.Unix(lastSeenAtSec, 0).UTC()
+	if now.Sub(lastSeen) < touchThrottle {
+		return nil
+	}
+
+	// Slow path: re-read inside the writer transaction so the throttle
+	// decision and the update are atomic. Otherwise two concurrent Touch
+	// calls could both observe a stale last_seen_at and both write.
 	return s.db.WithWriteTx(ctx, func(tx db.Tx) error {
 		var (
 			createdAtSec  int64
-			lastSeenAtSec int64
 			expiresAtSec  int64
 		)
 		err := tx.QueryRowContext(ctx, `
 			SELECT created_at, last_seen_at, expires_at FROM sessions WHERE id = ?
 		`, id).Scan(&createdAtSec, &lastSeenAtSec, &expiresAtSec)
 		if errors.Is(err, sql.ErrNoRows) {
-			// Touch on a nonexistent ID is a no-op. The HTTP layer rejects
-			// the request via Get's ErrNotFound; we don't need to surface
-			// the same failure twice.
 			return nil
 		}
 		if err != nil {
@@ -220,7 +239,8 @@ func (s *Store) Touch(ctx context.Context, id string) error {
 			return nil
 		}
 
-		// Throttle: skip the write if the last update was within 60s.
+		// Re-check the throttle with the in-transaction read, in case
+		// another Touch landed between the fast-path read and BEGIN.
 		lastSeen := time.Unix(lastSeenAtSec, 0).UTC()
 		if now.Sub(lastSeen) < touchThrottle {
 			return nil

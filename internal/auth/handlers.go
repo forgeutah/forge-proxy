@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -241,7 +240,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userAgent := r.Header.Get("User-Agent")
-	ip := clientIP(r)
+	ip := httplog.ClientIP(r)
 	sess, err := h.Sessions.Create(r.Context(), u.ID, userAgent, ip)
 	if err != nil {
 		logger.Error("auth/callback: session create", "error", err.Error(), "user_id", u.ID)
@@ -334,21 +333,5 @@ func parseClaims(idToken *oidc.IDToken) (*idTokenClaims, error) {
 		}
 	}
 	return &c, nil
-}
-
-// clientIP returns a best-effort client IP for session-row recording. We
-// don't rely on this for any security decision (sessions aren't IP-bound)
-// — it's logged so admins can see "this session was created from this IP"
-// when investigating an incident.
-func clientIP(r *http.Request) string {
-	// X-Forwarded-For is set by trusted upstream layers in production
-	// (Cloudflare or the exe.dev load balancer) but is the user's input
-	// otherwise. For a v1 single-VM deploy with public IP we don't trust
-	// it — use the remote address.
-	addr := r.RemoteAddr
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		addr = addr[:i]
-	}
-	return strings.Trim(addr, "[]")
 }
 

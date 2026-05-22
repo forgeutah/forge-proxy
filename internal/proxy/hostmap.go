@@ -42,12 +42,21 @@ func NewHostMap(upstreams map[string]*url.URL) HostMap {
 // emit for an upstream that exists but fails. Distinguishing the two at the
 // boundary keeps the error-handling explicit.
 func (m HostMap) Resolve(host string) (*url.URL, bool) {
+	u, ok := m[NormalizeHost(host)]
+	return u, ok
+}
+
+// NormalizeHost applies the canonical Host header normalisation rule used
+// throughout the proxy: lowercase the value and strip any ":port" suffix.
+// Exported so the host-dispatching layer in cmd/forge-proxy/main.go can apply
+// the same rule when comparing inbound Host against the configured auth host
+// — one normalisation function, one place.
+func NormalizeHost(host string) string {
 	host = strings.ToLower(host)
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]
 	}
-	u, ok := m[host]
-	return u, ok
+	return host
 }
 
 // Hosts returns the configured inbound hosts in arbitrary order. Used by the
