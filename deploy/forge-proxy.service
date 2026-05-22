@@ -1,0 +1,54 @@
+[Unit]
+# forge-proxy systemd unit — drop into /etc/systemd/system/ on the
+# exe.dev VM. See README "Build and run" for the full deploy sequence.
+Description=Forge Utah auth proxy
+Documentation=https://github.com/forgeutah/forge-proxy
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated unprivileged user owns /var/lib/forge-proxy (the SQLite file's
+# home). Create with:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin forge-proxy
+#   sudo install -d -o forge-proxy -g forge-proxy -m 0750 /var/lib/forge-proxy
+User=forge-proxy
+Group=forge-proxy
+
+# All configuration comes from a single env file. The file is mode 0600,
+# owned by root, readable by the forge-proxy user via group membership.
+# Systemd applies it natively — no need for the binary's --env-file flag
+# when running under systemd.
+EnvironmentFile=/etc/forge-proxy.env
+
+ExecStart=/usr/local/bin/forge-proxy
+
+# Graceful shutdown: binary handles SIGTERM with a 30s deadline; give
+# systemd one extra second before it falls back to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=31s
+
+# Restart on crash with a small backoff so a broken release doesn't
+# hot-loop the JWKS retries.
+Restart=on-failure
+RestartSec=5s
+
+# Hardening — the binary needs network access (Slack OIDC + Tailscale
+# upstreams), read access to its env file, and write access to its data
+# directory. Everything else can be locked down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/forge-proxy
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

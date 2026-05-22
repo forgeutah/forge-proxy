@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"github.com/forgeutah/forge-proxy/internal/auth"
 	"github.com/forgeutah/forge-proxy/internal/config"
 	"github.com/forgeutah/forge-proxy/internal/db"
@@ -30,6 +32,30 @@ import (
 )
 
 func main() {
+	// Strip `--env-file <path>` / `--env-file=<path>` from os.Args[1:]
+	// BEFORE subcommand dispatch. The flag is a global option that applies
+	// to both server and admin paths so the same /etc/forge-proxy.env can
+	// drive every invocation:
+	//
+	//   forge-proxy --env-file /etc/forge-proxy.env
+	//   forge-proxy --env-file /etc/forge-proxy.env admin set-roles ...
+	//
+	// Values already present in the process environment win over the file
+	// (godotenv default — explicit shell beats file). systemd's
+	// EnvironmentFile= directive does the same job natively; this flag
+	// exists for ad-hoc invocations and for hosts that don't use systemd.
+	args, envFile, err := extractEnvFileFlag(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
+		os.Exit(1)
+	}
+	if envFile != "" {
+		if err := godotenv.Load(envFile); err != nil {
+			fmt.Fprintf(os.Stderr, "forge-proxy: load env file %s: %v\n", envFile, err)
+			os.Exit(1)
+		}
+	}
+
 	// `forge-proxy admin <sub> [args]` dispatches to the admin CLI; every
 	// other invocation drops through to run() which serves traffic. The
 	// admin path is intentionally first so an operator running the binary
@@ -37,8 +63,8 @@ func main() {
 	// the server) can `docker exec ... forge-proxy admin set-roles ...`
 	// without a separate image. See cmd/forge-proxy/admin.go for the
 	// concurrent-writer coordination notes.
-	if len(os.Args) > 1 && os.Args[1] == "admin" {
-		if err := runAdmin(os.Args[2:]); err != nil {
+	if len(args) > 0 && args[0] == "admin" {
+		if err := runAdmin(args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "forge-proxy admin: %v\n", err)
 			os.Exit(1)
 		}
@@ -49,6 +75,36 @@ func main() {
 		// yet (config load failure happens before setupLogging).
 		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// extractEnvFileFlag returns args with any `--env-file <path>` /
+// `--env-file=<path>` removed, and the path itself (or "" if absent). Only
+// recognises the flag in leading position (before any subcommand) so admin
+// subcommand flags don't collide.
+//
+// Errors:
+//   - `--env-file` with no following arg
+//   - `--env-file=` (empty value)
+func extractEnvFileFlag(args []string) ([]string, string, error) {
+	if len(args) == 0 {
+		return args, "", nil
+	}
+	first := args[0]
+	switch {
+	case first == "--env-file":
+		if len(args) < 2 {
+			return nil, "", errors.New("--env-file requires a path argument")
+		}
+		return args[2:], args[1], nil
+	case strings.HasPrefix(first, "--env-file="):
+		value := strings.TrimPrefix(first, "--env-file=")
+		if value == "" {
+			return nil, "", errors.New("--env-file= requires a non-empty path")
+		}
+		return args[1:], value, nil
+	default:
+		return args, "", nil
 	}
 }
 

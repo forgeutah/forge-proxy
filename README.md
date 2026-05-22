@@ -94,14 +94,93 @@ the proxy secret is the application half.
 
 ### 4. Configure environment
 
-See the [environment variables](#environment-variables) section below.
-Generate `PROXY_SECRET` with `openssl rand -hex 32`.
+Copy [`.env.example`](.env.example) to `/etc/forge-proxy.env` on the VM
+and fill in the real values:
 
-### 5. Build and run
+```sh
+sudo install -m 600 -o root -g root .env.example /etc/forge-proxy.env
+sudo $EDITOR /etc/forge-proxy.env
+```
 
-Two paths — pick whichever fits your deploy mechanism.
+You'll need: the Slack client ID + secret from step 1, your workspace's
+`SLACK_TEAM_ID`, the `UPSTREAMS` mapping for each Forge app, and a
+freshly-generated `PROXY_SECRET`:
 
-**(a) Docker** (if your host runs containers):
+```sh
+openssl rand -hex 32   # paste into /etc/forge-proxy.env
+```
+
+See the [environment variables](#environment-variables) section below
+for the full reference.
+
+### 5. Run the binary (default: bare binary + systemd)
+
+Download the tarball matching the VM's arch from the
+[Releases page](https://github.com/forgeutah/forge-proxy/releases) and
+install:
+
+```sh
+# Pick linux_amd64 or linux_arm64 to match `uname -m` (x86_64 → amd64,
+# aarch64 → arm64). The linux builds are statically linked — they run on
+# any modern Linux with no glibc/musl dependency.
+curl -fsSL https://github.com/forgeutah/forge-proxy/releases/latest/download/forge-proxy_<version>_linux_amd64.tar.gz | tar -xz
+sudo install -m 755 forge-proxy /usr/local/bin/
+
+# Always verify against checksums.txt on the release page before running
+# anything pulled from the internet.
+```
+
+Create the dedicated user + data directory:
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin forge-proxy
+sudo install -d -o forge-proxy -g forge-proxy -m 0750 /var/lib/forge-proxy
+sudo chown root:forge-proxy /etc/forge-proxy.env
+sudo chmod 0640 /etc/forge-proxy.env
+```
+
+Install the systemd unit from [`deploy/forge-proxy.service`](deploy/forge-proxy.service)
+and start it:
+
+```sh
+sudo cp deploy/forge-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now forge-proxy
+sudo systemctl status forge-proxy
+```
+
+The unit applies the env file via `EnvironmentFile=`, runs as the
+unprivileged `forge-proxy` user, and locks down the rest of the
+filesystem via the standard systemd hardening directives
+(`ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, etc.).
+
+**Ad-hoc invocation** (e.g. one-off admin commands from the same env):
+
+```sh
+sudo -u forge-proxy /usr/local/bin/forge-proxy --env-file /etc/forge-proxy.env admin list-users
+```
+
+The `--env-file` flag is a global option — it works before any
+subcommand. Values already in the process environment win over the file
+(shell beats file), so you can override individual keys for debugging
+without editing `/etc/forge-proxy.env`.
+
+This is enough to run the proxy. The SQLite file at
+`/var/lib/forge-proxy/forge.db` is the source of truth; the persistent
+disk's own snapshot/backup story (whatever your host provides) is your
+recovery boundary. If the disk fails and you have no off-host backup,
+you lose every user record and active session — fresh sign-ins
+re-provision users from Slack, and roles you'd manually granted are
+gone.
+
+If that's an acceptable risk for now, you're done.
+Skip to **6. Verify**. Add Litestream later (see
+[off-host backup](#off-host-backup-optional-litestream--cloudflare-r2))
+when the data-loss surface grows.
+
+#### Alternative: Docker
+
+If your host runs containers and you'd rather not manage a systemd unit:
 
 ```sh
 docker build -t forge-proxy:latest .
@@ -109,44 +188,13 @@ docker run -d \
   --name forge-proxy \
   --restart=unless-stopped \
   -p 8080:8080 \
-  -v /data:/data \
+  -v /var/lib/forge-proxy:/data \
   --env-file /etc/forge-proxy.env \
   forge-proxy:latest
 ```
 
-**(b) Pre-built binary** (no Docker, run the static binary directly):
-
-Grab the tarball matching your VM's arch from the
-[Releases page](https://github.com/forgeutah/forge-proxy/releases). The
-linux builds are statically linked (no glibc / musl dependency) and run
-on any modern x86_64 or arm64 Linux:
-
-```sh
-curl -fsSL https://github.com/forgeutah/forge-proxy/releases/latest/download/forge-proxy_<version>_linux_amd64.tar.gz | tar -xz
-sudo install -m 755 forge-proxy /usr/local/bin/
-/usr/local/bin/forge-proxy   # reads env vars from the environment
-```
-
-Verify against `checksums.txt` on the same release page before running.
-Wire up systemd (or your host's init system) however you'd normally run
-a long-lived service. The binary handles SIGTERM with a 30s graceful
-shutdown.
-
-(exe.dev's exact deploy mechanism — `docker run`, a managed service
-descriptor, systemd on the VM, or something else — is your choice; the
-binary is environment-driven and works with any of them.)
-
-This is enough to run the proxy. The SQLite file at `/data/forge.db` is
-the source of truth; the persistent disk's own snapshot/backup story
-(whatever your host provides) is your recovery boundary. If the disk
-itself fails and you have no off-host backup, you lose every user record
-and active session — fresh sign-ins will re-provision users from Slack,
-and roles you'd manually granted will be gone.
-
-If that's an acceptable risk for your stage of operation, you're done.
-Skip ahead to **6. Verify**. Add Litestream later (see the
-[off-host backup](#off-host-backup-optional-litestream--cloudflare-r2)
-section) when the data loss surface grows.
+Set `DB_PATH=/data/forge.db` in `/etc/forge-proxy.env` to match the
+volume mount. Everything else is identical.
 
 ### 6. Verify
 
