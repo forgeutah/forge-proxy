@@ -14,8 +14,6 @@ name: docker
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
 

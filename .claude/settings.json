@@ -1,7 +1,37 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git init *)"
+      "Bash(git init *)",
+      "Bash(git commit -m ' *)",
+      "Bash(go version *)",
+      "Bash(go mod *)",
+      "Bash(go build *)",
+      "Bash(go test *)",
+      "Bash(git add *)",
+      "Bash(git reset *)",
+      "Bash(go vet *)",
+      "mcp__claude_ai_Context7__resolve-library-id",
+      "mcp__claude_ai_Context7__query-docs",
+      "Bash(go get *)",
+      "Bash(git -C /Users/clintberry/Code/forgeutah/forge-proxy status)",
+      "Bash(go env *)",
+      "Bash(command -v docker)",
+      "Bash(docker version *)",
+      "Bash(docker info *)",
+      "Bash(docker build *)",
+      "Bash(docker run *)",
+      "Read(//Users/clintberry/.claude/plugins/cache/every-marketplace/compound-engineering/3.8.1/skills/ce-work/references/**)",
+      "Bash(go doc *)",
+      "Bash(find /Users/clintberry/Code/forgeutah -name \"*.go\" -path \"*/go-oidc/*\" 2>/dev/null | head -5)",
+      "Read(//Users/clintberry/Code/forgeutah/**)",
+      "Bash(mkdir -p /tmp/compound-engineering/ce-code-review/20260522-155012-64348b3b/)",
+      "Bash(goreleaser check *)",
+      "Bash(goreleaser release *)",
+      "Bash(docker buildx *)",
+      "Bash(docker rmi *)"
+    ],
+    "additionalDirectories": [
+      "/private/tmp/compound-engineering/ce-code-review/20260522-155012-64348b3b"
     ]
   }
 }
