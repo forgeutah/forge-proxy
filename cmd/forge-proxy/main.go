@@ -30,6 +30,20 @@ import (
 )
 
 func main() {
+	// `forge-proxy admin <sub> [args]` dispatches to the admin CLI; every
+	// other invocation drops through to run() which serves traffic. The
+	// admin path is intentionally first so an operator running the binary
+	// inside the production container (where env vars are configured for
+	// the server) can `docker exec ... forge-proxy admin set-roles ...`
+	// without a separate image. See cmd/forge-proxy/admin.go for the
+	// concurrent-writer coordination notes.
+	if len(os.Args) > 1 && os.Args[1] == "admin" {
+		if err := runAdmin(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "forge-proxy admin: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		// Fall back to stderr without slog — slog may not be configured
 		// yet (config load failure happens before setupLogging).

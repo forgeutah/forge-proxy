@@ -1,0 +1,36 @@
+# Keep the build context small. Anything not needed at build time goes here.
+
+# Version control
+.git
+.gitignore
+
+# Editor / IDE state
+.vscode
+.idea
+.claude
+
+# Local docs (operator content, not needed in the image)
+docs/
+
+# Local SQLite state — must never leak into an image
+*.db
+*.db-wal
+*.db-shm
+
+# Local env / secrets
+.env
+.env.local
+litestream.yml.local
+
+# Build artifacts
+/forge-proxy
+/dist
+/tmp
+
+# OS noise
+.DS_Store
+
+# Container artifacts themselves — including the Dockerfile means edits to
+# only the Dockerfile still rebuild, but copies of it into the image are
+# pointless.
+Dockerfile.dockerignore

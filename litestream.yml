@@ -1,0 +1,35 @@
+# Litestream replication for the Forge auth-proxy SQLite database.
+#
+# This file is checked in WITHOUT secrets. The R2 account ID, bucket name,
+# and access keys come from the environment at deploy time — Litestream
+# expands ${VAR} references against the process environment.
+#
+# Operator notes:
+#   - The proxy and Litestream both write to /data/forge.db: the proxy as
+#     the SQLite owner, Litestream as the WAL shipper. Litestream attaches
+#     to the WAL via the standard SQLite file lock — no special config
+#     required.
+#   - Use a write-only IAM credential for ${R2_ACCESS_KEY_ID}. A separate
+#     read-only credential exists only for operator-initiated restore
+#     (`litestream restore -o /data/forge.db <replica-url>`).
+#   - Bucket access logging should be enabled with an alert on unexpected
+#     GetObject calls — a read-access compromise grants every active
+#     session ID (incident response: `forge-proxy admin force-logout-all`).
+#   - See https://litestream.io/reference/config/ for the full schema.
+
+dbs:
+  - path: /data/forge.db
+    replicas:
+      - type: s3
+        endpoint: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+        bucket: ${R2_BUCKET}
+        path: forge.db
+        access-key-id: ${R2_ACCESS_KEY_ID}
+        secret-access-key: ${R2_SECRET_ACCESS_KEY}
+        # Default Litestream cadence: ship WAL frames every second.
+        # Tighter than this only matters if the RPO budget is sub-second,
+        # which it isn't for v1.
+        sync-interval: 1s
+        # 30 days of point-in-time recovery. Adjust against bucket cost
+        # once real WAL volume is observed.
+        retention: 720h
