@@ -44,7 +44,26 @@ func main() {
 	// (godotenv default — explicit shell beats file). systemd's
 	// EnvironmentFile= directive does the same job natively; this flag
 	// exists for ad-hoc invocations and for hosts that don't use systemd.
-	args, envFile, err := extractEnvFileFlag(os.Args[1:])
+	args := os.Args[1:]
+	var (
+		envFile  string
+		daemon   bool
+		pidFile  string
+		logFile  string
+		err      error
+	)
+	args, envFile, err = extractEnvFileFlag(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
+		os.Exit(1)
+	}
+	args, daemon = extractBoolFlag(args, "--daemon")
+	args, pidFile, err = extractValueFlag(args, "--pid-file")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
+		os.Exit(1)
+	}
+	args, logFile, err = extractValueFlag(args, "--log-file")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
 		os.Exit(1)
@@ -86,12 +105,56 @@ func main() {
 		}
 		return
 	}
+
+	// `forge-proxy setup <sub>` handles one-shot host setup tasks. The
+	// only subcommand today is `systemd` — creates the user, data
+	// directory, writes the unit, runs daemon-reload + enable --now.
+	if len(args) > 0 && args[0] == "setup" {
+		if err := runSetup(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "forge-proxy setup: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// --daemon flow: in the *parent* invocation, fork-and-detach via
+	// daemonize() then exit. In the *child* (marker env set), skip the
+	// fork and fall through to the normal server startup with stdio
+	// already redirected to the log file. The marker env check
+	// guarantees we never re-fork in an infinite loop.
+	if daemon && !isDaemonChild() {
+		// The child re-executes os.Args[0] with the same args minus
+		// --daemon / --pid-file / --log-file (we've already stripped
+		// them from `args`). Pass `args` so the child only sees the
+		// flags the user actually wants forwarded — --env-file, any
+		// future global flags, but NOT --daemon (which would recurse).
+		if err := daemonize(rebuildChildArgs(envFile, args), pidFile, logFile); err != nil {
+			fmt.Fprintf(os.Stderr, "forge-proxy: --daemon: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		// Fall back to stderr without slog — slog may not be configured
 		// yet (config load failure happens before setupLogging).
 		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// rebuildChildArgs reconstructs the argv slice the daemon child receives.
+// We strip --daemon / --pid-file / --log-file (one-shot parent-only
+// flags) and forward --env-file plus whatever else was on the line. The
+// child re-runs extractEnvFileFlag etc. against this slice from scratch,
+// so the marker env is the only signal that daemonize() must be skipped.
+func rebuildChildArgs(envFile string, remaining []string) []string {
+	out := make([]string, 0, len(remaining)+2)
+	if envFile != "" {
+		out = append(out, "--env-file", envFile)
+	}
+	out = append(out, remaining...)
+	return out
 }
 
 // defaultEnvFileCandidates is the search path used when --env-file isn't
@@ -124,6 +187,46 @@ func defaultEnvFilePath() string {
 		}
 	}
 	return ""
+}
+
+// extractValueFlag walks args from the front, stripping `<flag> <value>`
+// / `<flag>=<value>` if it appears in a leading position (i.e. before any
+// non-flag arg / subcommand). Returns (rewritten args, value, err).
+// Empty value is treated as missing.
+//
+// Used for --pid-file and --log-file (and previously --env-file, which
+// has its own wrapper for backward-compat reasons).
+func extractValueFlag(args []string, flag string) ([]string, string, error) {
+	if len(args) == 0 {
+		return args, "", nil
+	}
+	first := args[0]
+	switch {
+	case first == flag:
+		if len(args) < 2 {
+			return nil, "", fmt.Errorf("%s requires a value", flag)
+		}
+		return args[2:], args[1], nil
+	case strings.HasPrefix(first, flag+"="):
+		value := strings.TrimPrefix(first, flag+"=")
+		if value == "" {
+			return nil, "", fmt.Errorf("%s= requires a non-empty value", flag)
+		}
+		return args[1:], value, nil
+	default:
+		return args, "", nil
+	}
+}
+
+// extractBoolFlag strips `<flag>` from the leading position of args if
+// present and returns (rewritten args, true). If absent, args are
+// unchanged and the second return is false. Boolean flags have no
+// trailing value.
+func extractBoolFlag(args []string, flag string) ([]string, bool) {
+	if len(args) > 0 && args[0] == flag {
+		return args[1:], true
+	}
+	return args, false
 }
 
 // extractEnvFileFlag returns args with any `--env-file <path>` /

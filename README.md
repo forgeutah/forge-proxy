@@ -149,32 +149,26 @@ path (first existing wins):
 `--env-file <path>` still works for explicit overrides; the auto
 discovery only fires when the flag is absent.
 
-Create the dedicated user + data directory:
+**Run as a daemon under systemd (one command):**
 
 ```sh
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin forge-proxy
-sudo install -d -o forge-proxy -g forge-proxy -m 0750 /var/lib/forge-proxy
-sudo chown root:forge-proxy /etc/forge-proxy.env
-sudo chmod 0640 /etc/forge-proxy.env
+sudo forge-proxy setup systemd
 ```
 
-**Run as a daemon under systemd** (the recommended path): install the
-unit from [`deploy/forge-proxy.service`](deploy/forge-proxy.service) and
-start it:
-
-```sh
-sudo cp deploy/forge-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now forge-proxy
-sudo systemctl status forge-proxy
-```
-
-The unit applies `/etc/forge-proxy.env` via systemd's `EnvironmentFile=`
-directive, runs as the unprivileged `forge-proxy` user, and locks down
-the filesystem with the standard hardening set
+The `setup systemd` subcommand creates the `forge-proxy` user + group,
+creates `/var/lib/forge-proxy/` with the right ownership and mode,
+writes a systemd unit at `/etc/systemd/system/forge-proxy.service` with
+the binary path resolved from the running executable, then runs
+`systemctl daemon-reload && systemctl enable --now forge-proxy` and
+prints the status. The unit applies the hardening directives
 (`ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, etc.).
 
-**Or run it directly** for testing or hosts without systemd:
+Re-running `setup systemd` is idempotent — existing user/group/dir are
+left in place; the unit file is overwritten (so don't hand-edit it,
+edit `cmd/forge-proxy/setup.go` and re-run).
+
+**Or run it directly** as a foreground process — testing, debugging, or
+hosts without systemd:
 
 ```sh
 # Auto-discovers /etc/forge-proxy.env per the search path above
@@ -185,6 +179,26 @@ forge-proxy admin list-users
 forge-proxy admin set-roles user@example.com admin,organizer
 ```
 
+**Or run it as a detached daemon without systemd** (e.g. on BSD or
+Alpine OpenRC, or when you just want `forge-proxy --daemon &`-style
+backgrounding):
+
+```sh
+sudo forge-proxy --daemon
+# forge-proxy: daemonized as pid 12345
+#   log file: /var/log/forge-proxy.log
+#   pid file: /var/run/forge-proxy.pid
+# stop with: kill $(cat /var/run/forge-proxy.pid)
+```
+
+The `--daemon` flag re-execs the binary with `setsid`, redirects
+stdout/stderr to a log file, writes a PID file, and returns. Override
+paths with `--pid-file` and `--log-file`; defaults fall back to `/tmp`
+if `/var/run` and `/var/log` aren't writable (so `--daemon` works for
+non-root testing too). If a PID file already exists and the recorded
+PID is alive, `--daemon` refuses to start — preventing accidental
+double-launches.
+
 Values already in the process environment win over the file (shell
 beats file), so you can override individual keys for debugging without
 editing `/etc/forge-proxy.env`:
@@ -192,6 +206,11 @@ editing `/etc/forge-proxy.env`:
 ```sh
 LOG_LEVEL=debug forge-proxy admin list-users
 ```
+
+**Manual systemd install** — if you'd rather see what `setup systemd`
+does before running it, [`deploy/forge-proxy.service`](deploy/forge-proxy.service)
+is the equivalent hand-installed unit; copy it to `/etc/systemd/system/`
+after creating the user + dir yourself.
 
 This is enough to run the proxy. The SQLite file at
 `/var/lib/forge-proxy/forge.db` is the source of truth; the persistent

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -257,6 +258,262 @@ func TestExtractEnvFileFlag(t *testing.T) {
 				t.Errorf("args = %v, want %v", gotArgs, tc.wantArgs)
 			}
 		})
+	}
+}
+
+// TestExtractValueFlag pins the generic value-flag parser used for
+// --pid-file and --log-file. Same shape as extractEnvFileFlag but
+// parameterised on the flag name.
+func TestExtractValueFlag(t *testing.T) {
+	cases := []struct {
+		name      string
+		flag      string
+		args      []string
+		wantArgs  []string
+		wantValue string
+		wantError bool
+	}{
+		{
+			name:     "absent",
+			flag:     "--pid-file",
+			args:     []string{"admin", "list-users"},
+			wantArgs: []string{"admin", "list-users"},
+		},
+		{
+			name:      "space form",
+			flag:      "--pid-file",
+			args:      []string{"--pid-file", "/var/run/forge.pid"},
+			wantArgs:  []string{},
+			wantValue: "/var/run/forge.pid",
+		},
+		{
+			name:      "equals form",
+			flag:      "--log-file",
+			args:      []string{"--log-file=/var/log/forge.log", "admin"},
+			wantArgs:  []string{"admin"},
+			wantValue: "/var/log/forge.log",
+		},
+		{
+			name:      "missing value (space form)",
+			flag:      "--pid-file",
+			args:      []string{"--pid-file"},
+			wantError: true,
+		},
+		{
+			name:      "empty value (equals form)",
+			flag:      "--pid-file",
+			args:      []string{"--pid-file="},
+			wantError: true,
+		},
+		{
+			name:     "not in leading position is ignored",
+			flag:     "--pid-file",
+			args:     []string{"admin", "--pid-file", "/x"},
+			wantArgs: []string{"admin", "--pid-file", "/x"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotArgs, gotValue, err := extractValueFlag(tc.args, tc.flag)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("expected error, got args=%v value=%q", gotArgs, gotValue)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotValue != tc.wantValue {
+				t.Errorf("value = %q, want %q", gotValue, tc.wantValue)
+			}
+			if !slicesEqual(gotArgs, tc.wantArgs) {
+				t.Errorf("args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+		})
+	}
+}
+
+// TestExtractBoolFlag pins the leading-position boolean-flag parser used
+// for --daemon. Bools have no value; presence is the signal.
+func TestExtractBoolFlag(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		flag     string
+		wantArgs []string
+		wantOn   bool
+	}{
+		{"absent", []string{"admin", "list-users"}, "--daemon", []string{"admin", "list-users"}, false},
+		{"present alone", []string{"--daemon"}, "--daemon", []string{}, true},
+		{"present before subcommand", []string{"--daemon", "admin"}, "--daemon", []string{"admin"}, true},
+		{"in non-leading position is ignored", []string{"admin", "--daemon"}, "--daemon", []string{"admin", "--daemon"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotArgs, gotOn := extractBoolFlag(tc.args, tc.flag)
+			if gotOn != tc.wantOn {
+				t.Errorf("on = %v, want %v", gotOn, tc.wantOn)
+			}
+			if !slicesEqual(gotArgs, tc.wantArgs) {
+				t.Errorf("args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+		})
+	}
+}
+
+// TestRebuildChildArgs verifies the args slice the daemon child receives
+// when re-execed. --env-file is forwarded so the child can re-load the
+// same file; --daemon / --pid-file / --log-file are stripped (they're
+// parent-only).
+func TestRebuildChildArgs(t *testing.T) {
+	cases := []struct {
+		name      string
+		envFile   string
+		remaining []string
+		want      []string
+	}{
+		{"no env file, no remaining args", "", nil, []string{}},
+		{"env file forwarded", "/etc/forge.env", nil, []string{"--env-file", "/etc/forge.env"}},
+		{
+			name:      "env file + remaining args",
+			envFile:   "/etc/forge.env",
+			remaining: []string{"admin", "list-users"},
+			want:      []string{"--env-file", "/etc/forge.env", "admin", "list-users"},
+		},
+		{
+			name:      "no env file, remaining args only",
+			envFile:   "",
+			remaining: []string{"admin", "list-users"},
+			want:      []string{"admin", "list-users"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rebuildChildArgs(tc.envFile, tc.remaining)
+			if !slicesEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsDaemonChild pins the marker-env check that prevents an infinite
+// re-exec loop. The child sees the marker env and skips the daemonize
+// branch entirely; the parent (no marker) does the fork.
+func TestIsDaemonChild(t *testing.T) {
+	t.Setenv(daemonMarkerEnv, "")
+	if isDaemonChild() {
+		t.Error("isDaemonChild() should be false when marker env is empty")
+	}
+	t.Setenv(daemonMarkerEnv, "1")
+	if !isDaemonChild() {
+		t.Error("isDaemonChild() should be true when marker env is '1'")
+	}
+	t.Setenv(daemonMarkerEnv, "0")
+	if isDaemonChild() {
+		t.Error("isDaemonChild() should be false when marker env is '0' (only '1' counts)")
+	}
+}
+
+// TestCheckExistingPIDFile pins the three branches: no file (proceed),
+// stale PID (proceed), live PID (refuse).
+func TestCheckExistingPIDFile(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("no file", func(t *testing.T) {
+		if err := checkExistingPIDFile(dir + "/missing.pid"); err != nil {
+			t.Errorf("expected nil for missing file, got %v", err)
+		}
+	})
+
+	t.Run("stale pid", func(t *testing.T) {
+		p := dir + "/stale.pid"
+		// PID 0 is invalid; FindProcess + signal(0) will reject. Some
+		// kernels return ESRCH for any obviously-dead PID — 0 or a
+		// huge unlikely-to-be-allocated value both serve.
+		if err := os.WriteFile(p, []byte("999999999\n"), 0o644); err != nil {
+			t.Fatalf("write stale pid: %v", err)
+		}
+		if err := checkExistingPIDFile(p); err != nil {
+			t.Errorf("expected nil for stale pid, got %v", err)
+		}
+	})
+
+	t.Run("malformed pid", func(t *testing.T) {
+		p := dir + "/junk.pid"
+		if err := os.WriteFile(p, []byte("not-a-pid\n"), 0o644); err != nil {
+			t.Fatalf("write junk pid: %v", err)
+		}
+		if err := checkExistingPIDFile(p); err != nil {
+			t.Errorf("expected nil for malformed pid (treated as stale), got %v", err)
+		}
+	})
+
+	t.Run("live pid (our own pid)", func(t *testing.T) {
+		p := dir + "/live.pid"
+		if err := os.WriteFile(p, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+			t.Fatalf("write live pid: %v", err)
+		}
+		err := checkExistingPIDFile(p)
+		if err == nil {
+			t.Error("expected error for live pid, got nil")
+		}
+	})
+}
+
+// TestRenderSystemdUnit verifies the unit template renders with the
+// expected substitutions. The actual systemctl call is out of test
+// scope — that needs root + systemd, neither is reasonable to assume.
+func TestRenderSystemdUnit(t *testing.T) {
+	params := systemdSetupParams{
+		User:       "forge-proxy",
+		Group:      "forge-proxy",
+		BinaryPath: "/opt/forge/forge-proxy",
+		EnvFile:    "/etc/forge-proxy.env",
+		DataDir:    "/var/lib/forge-proxy",
+		UnitPath:   "/etc/systemd/system/forge-proxy.service",
+	}
+	out, err := renderSystemdUnit(params)
+	if err != nil {
+		t.Fatalf("renderSystemdUnit: %v", err)
+	}
+
+	expectedSubstrings := []string{
+		"User=forge-proxy",
+		"Group=forge-proxy",
+		"EnvironmentFile=/etc/forge-proxy.env",
+		"ExecStart=/opt/forge/forge-proxy",
+		"ReadWritePaths=/var/lib/forge-proxy",
+		// Hardening directives that should always be present.
+		"NoNewPrivileges=true",
+		"ProtectSystem=strict",
+		"PrivateTmp=true",
+		"WantedBy=multi-user.target",
+	}
+	for _, want := range expectedSubstrings {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered unit missing %q", want)
+		}
+	}
+}
+
+// TestDefaultSystemdParams verifies the binary path is taken from the
+// running executable, not hardcoded. Lets `forge-proxy setup systemd`
+// work correctly when installed somewhere non-standard.
+func TestDefaultSystemdParams(t *testing.T) {
+	params, err := defaultSystemdParams()
+	if err != nil {
+		t.Fatalf("defaultSystemdParams: %v", err)
+	}
+	if params.BinaryPath == "" {
+		t.Error("BinaryPath should not be empty")
+	}
+	if params.User != "forge-proxy" || params.Group != "forge-proxy" {
+		t.Errorf("user/group = %s/%s, want forge-proxy/forge-proxy", params.User, params.Group)
+	}
+	if params.EnvFile != "/etc/forge-proxy.env" {
+		t.Errorf("EnvFile = %q, want /etc/forge-proxy.env", params.EnvFile)
 	}
 }
 
