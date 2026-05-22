@@ -92,23 +92,12 @@ nodes on their HTTP ports — every other tailnet member (laptops, admin
 tooling) is explicitly denied. This is the network half of the trust model;
 the proxy secret is the application half.
 
-### 4. Cloudflare R2 bucket
-
-1. Create a bucket (e.g. `forge-proxy-backups`).
-2. Generate a **write-only** R2 credential for the proxy: `PutObject` only,
-   no `GetObject` or `ListBucket`. This is what Litestream uses.
-3. Generate a separate **read-only** credential for operator-initiated
-   restore. Store it in a password manager — do NOT deploy it to the VM.
-4. Enable bucket access logging and configure an alert on unexpected
-   `GetObject` calls (the read-only credential is the only legitimate
-   reader). Any other read triggers the incident-response runbook below.
-
-### 5. Configure environment
+### 4. Configure environment
 
 See the [environment variables](#environment-variables) section below.
 Generate `PROXY_SECRET` with `openssl rand -hex 32`.
 
-### 6. Build and run
+### 5. Build and run
 
 ```sh
 docker build -t forge-proxy:latest .
@@ -125,20 +114,19 @@ docker run -d \
 descriptor, or something else — is TBD; the binary is environment-driven
 and works with any of them.)
 
-Run Litestream in a sidecar:
+This is enough to run the proxy. The SQLite file at `/data/forge.db` is
+the source of truth; the persistent disk's own snapshot/backup story
+(whatever your host provides) is your recovery boundary. If the disk
+itself fails and you have no off-host backup, you lose every user record
+and active session — fresh sign-ins will re-provision users from Slack,
+and roles you'd manually granted will be gone.
 
-```sh
-docker run -d \
-  --name forge-litestream \
-  --restart=unless-stopped \
-  -v /data:/data \
-  -v /etc/litestream.yml:/etc/litestream.yml:ro \
-  --env-file /etc/forge-r2.env \
-  litestream/litestream:latest \
-  replicate -config /etc/litestream.yml
-```
+If that's an acceptable risk for your stage of operation, you're done.
+Skip ahead to **6. Verify**. Add Litestream later (see the
+[off-host backup](#off-host-backup-optional-litestream--cloudflare-r2)
+section) when the data loss surface grows.
 
-### 7. Verify
+### 6. Verify
 
 ```sh
 # Liveness — should print "ok"
@@ -168,7 +156,7 @@ curl https://auth.forgeutah.tech/readyz
 | `SESSION_IDLE_TIMEOUT` | optional | Sliding idle timeout. Defaults to `336h` (14 days). Must be ≤ `SESSION_LIFETIME`. |
 | `DEFAULT_LANDING_URL` | optional | Where signed-in users land when they hit the auth host root without an explicit `return_to`. Defaults to `https://<AUTH_HOST>/`. |
 | `LOG_LEVEL` | optional | One of `debug`, `info`, `warn`, `error`. Defaults to `info`. |
-| `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | yes (for Litestream sidecar) | The write-only R2 credential. Consumed by `litestream.yml`, not by the proxy binary. |
+| `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | optional (Litestream backup only) | The write-only R2 credential. Consumed by the Litestream sidecar's `litestream.yml`, not by the proxy binary. Omit entirely if you're not running Litestream. See [off-host backup](#off-host-backup-optional-litestream--cloudflare-r2). |
 
 ---
 
@@ -293,7 +281,51 @@ or moving to short-lived asymmetric signatures.
 
 ---
 
-## Restoring from Litestream backup
+## Off-host backup (optional: Litestream + Cloudflare R2)
+
+The default deploy has no off-host backup — your data lives wherever your
+persistent disk lives. If you need point-in-time recovery, continuous
+replication, or protection against disk failure, the standard answer is
+[Litestream](https://litestream.io/) streaming the SQLite WAL to a
+Cloudflare R2 bucket as a sidecar process.
+
+Skip this section if you're fine with disk-level snapshots (or no backup
+at all) for now.
+
+### Set up the R2 bucket
+
+1. Create a bucket (e.g. `forge-proxy-backups`).
+2. Generate a **write-only** R2 credential for the proxy: `PutObject`
+   only, no `GetObject` or `ListBucket`. This is what Litestream uses.
+3. Generate a separate **read-only** credential for operator-initiated
+   restore. Store it in a password manager — do NOT deploy it to the VM.
+4. Enable bucket access logging and configure an alert on unexpected
+   `GetObject` calls (the read-only credential is the only legitimate
+   reader). Any other read triggers the
+   [bucket-compromise incident response](#incident-response-backup-bucket-compromise)
+   below.
+
+### Run the Litestream sidecar
+
+Set the R2 env vars in `/etc/forge-r2.env`
+(`R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`).
+The repo's `litestream.yml` consumes them via env-var substitution.
+
+```sh
+docker run -d \
+  --name forge-litestream \
+  --restart=unless-stopped \
+  -v /data:/data \
+  -v /etc/litestream.yml:/etc/litestream.yml:ro \
+  --env-file /etc/forge-r2.env \
+  litestream/litestream:latest \
+  replicate -config /etc/litestream.yml
+```
+
+The sidecar shares the `/data` volume with the proxy container — that's
+how it sees the SQLite file and its WAL.
+
+### Restore
 
 ```sh
 litestream restore -o /data/forge.db \
@@ -313,8 +345,8 @@ sqlite3 /data/forge.db 'SELECT COUNT(*) FROM sessions;'
 
 After a restore, every active session continues to work (their IDs are in
 the restored sessions table). If the restore is part of recovering from a
-bucket compromise — see incident response below — force-logout-all
-*before* serving traffic from the restored DB.
+bucket compromise, force-logout-all *before* serving traffic from the
+restored DB.
 
 ---
 
@@ -334,6 +366,10 @@ a no-op that prints a 0-row deletion.
 ---
 
 ## Incident response: backup-bucket compromise
+
+*Applies only if you're running the optional Litestream + R2 backup. If
+you have no off-host backup, skip this section — there's no bucket to
+compromise.*
 
 The R2 bucket contains the entire SQLite database, including the active
 sessions table. **Any unauthorized read of the bucket grants temporary
