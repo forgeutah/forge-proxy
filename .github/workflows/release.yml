@@ -1,0 +1,53 @@
+# Release workflow: builds cross-platform binaries and publishes them as a
+# GitHub Release whenever a `v*` tag is pushed.
+#
+# Cadence:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# The workflow creates the release in draft mode (see .goreleaser.yaml) so
+# a human can verify artifacts before clicking publish. Flip `draft: false`
+# in .goreleaser.yaml once you trust the pipeline.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# goreleaser writes to the Releases API and uploads artifacts.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # goreleaser inspects the full git history to generate release
+          # notes from commit messages between this tag and the previous.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Match go.mod's toolchain so the matrix builds the same way as
+          # local dev. Bump when go.mod bumps.
+          go-version: '1.25'
+          # Cache module + build downloads to keep release runs under a
+          # minute end-to-end.
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          # Pin to goreleaser v2 (config schema version: 2 in
+          # .goreleaser.yaml). Bump deliberately, not implicitly.
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

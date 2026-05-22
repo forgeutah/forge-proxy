@@ -99,6 +99,10 @@ Generate `PROXY_SECRET` with `openssl rand -hex 32`.
 
 ### 5. Build and run
 
+Two paths — pick whichever fits your deploy mechanism.
+
+**(a) Docker** (if your host runs containers):
+
 ```sh
 docker build -t forge-proxy:latest .
 docker run -d \
@@ -110,9 +114,27 @@ docker run -d \
   forge-proxy:latest
 ```
 
-(exe.dev's exact deploy mechanism — bare `docker run`, a managed service
-descriptor, or something else — is TBD; the binary is environment-driven
-and works with any of them.)
+**(b) Pre-built binary** (no Docker, run the static binary directly):
+
+Grab the tarball matching your VM's arch from the
+[Releases page](https://github.com/forgeutah/forge-proxy/releases). The
+linux builds are statically linked (no glibc / musl dependency) and run
+on any modern x86_64 or arm64 Linux:
+
+```sh
+curl -fsSL https://github.com/forgeutah/forge-proxy/releases/latest/download/forge-proxy_<version>_linux_amd64.tar.gz | tar -xz
+sudo install -m 755 forge-proxy /usr/local/bin/
+/usr/local/bin/forge-proxy   # reads env vars from the environment
+```
+
+Verify against `checksums.txt` on the same release page before running.
+Wire up systemd (or your host's init system) however you'd normally run
+a long-lived service. The binary handles SIGTERM with a 30s graceful
+shutdown.
+
+(exe.dev's exact deploy mechanism — `docker run`, a managed service
+descriptor, systemd on the VM, or something else — is your choice; the
+binary is environment-driven and works with any of them.)
 
 This is enough to run the proxy. The SQLite file at `/data/forge.db` is
 the source of truth; the persistent disk's own snapshot/backup story

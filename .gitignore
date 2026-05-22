@@ -11,7 +11,7 @@
 .env.local
 litestream.yml.local
 
-# Go build cache
+# Build output (goreleaser writes here; also covers ad-hoc `go build`)
 /dist/
 /tmp/
 

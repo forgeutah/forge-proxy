@@ -1,0 +1,111 @@
+# GoReleaser config for forge-proxy.
+#
+# Triggered by .github/workflows/release.yml on a `v*` tag push. Produces
+# one tarball per (OS, arch) pair plus a checksums.txt, all attached to a
+# new GitHub release with auto-generated notes.
+#
+# Local dry-run: `goreleaser release --snapshot --clean`
+# Local production run: requires GITHUB_TOKEN set in env.
+
+version: 2
+
+project_name: forge-proxy
+
+# Tests run before the release is cut. If they fail, no artifacts get
+# uploaded — the safety net for a "tag and forget" release cadence.
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: forge-proxy
+    main: ./cmd/forge-proxy
+    binary: forge-proxy
+    env:
+      # modernc.org/sqlite is pure-Go; CGO off keeps the binary statically
+      # linked and trivially cross-compilable.
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: forge-proxy
+    ids:
+      - forge-proxy
+    # Tarball name: forge-proxy_<version>_<os>_<arch>.tar.gz
+    # Example: forge-proxy_0.1.0_linux_arm64.tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}amd64
+      {{- else if eq .Arch "arm64" }}arm64
+      {{- else }}{{ .Arch }}{{ end }}
+    formats: ['tar.gz']
+    files:
+      - README.md
+      - litestream.yml
+      - docs/plans/2026-05-20-001-feat-forge-auth-proxy-plan.md
+      - docs/brainstorms/forge-auth-proxy-requirements.md
+
+checksum:
+  name_template: 'checksums.txt'
+
+# Snapshot mode (untagged builds) gets a non-conflicting version stamp.
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+# Auto-generated release notes from commit messages between this tag and
+# the previous one. Skip noise commits.
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Refactor & docs
+      regexp: '^.*?(refactor|docs)(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - '^chore:'
+      - '^test:'
+      - 'Merge pull request'
+      - 'Merge branch'
+
+release:
+  # Mark as draft so a human reviews artifacts before publishing. Flip to
+  # false once the cadence is established and you trust the workflow.
+  draft: true
+  prerelease: auto
+  name_template: "v{{.Version}}"
+  header: |
+    # forge-proxy {{.Tag}}
+
+    Pre-built binaries for the Forge Utah auth proxy. Pick the tarball
+    matching your VM's OS and arch (most exe.dev VMs are `linux_amd64`
+    or `linux_arm64`).
+
+    Verify before installing:
+
+    ```sh
+    sha256sum -c checksums.txt
+    ```
+  footer: |
+    ---
+
+    Deployment: see the [operator runbook](README.md) in the bundled
+    archive or the source tree.
