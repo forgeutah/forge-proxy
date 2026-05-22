@@ -52,6 +52,7 @@ archives:
     formats: ['tar.gz']
     files:
       - README.md
+      - .env.example
       - litestream.yml
       - docs/plans/2026-05-20-001-feat-forge-auth-proxy-plan.md
       - docs/brainstorms/forge-auth-proxy-requirements.md

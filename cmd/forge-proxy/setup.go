@@ -161,6 +161,21 @@ func runSetupSystemd(args []string) error {
 		return err
 	}
 
+	// 2b. Env file permissions. install.sh writes /etc/forge-proxy.env
+	// as mode 0600 root:root (safe default before forge-proxy group
+	// exists). Now that the group exists, fix to 0640 root:forge-proxy
+	// so `sudo -u forge-proxy forge-proxy admin ...` invocations can
+	// read it. systemd's EnvironmentFile= directive runs as root before
+	// dropping privileges so it works either way; this is purely for
+	// the ad-hoc admin path.
+	if err := fixEnvFilePermissions(params.EnvFile, params.Group); err != nil {
+		// Non-fatal — the env file might not exist yet (operator
+		// hasn't installed it), or might be at a non-default path
+		// (FORGE_PROXY_ENV_FILE override). Surface a warning but keep
+		// going; the systemd service still starts.
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+	}
+
 	// 3. Unit file.
 	unit, err := renderSystemdUnit(params)
 	if err != nil {
@@ -234,6 +249,41 @@ func ensureSystemUser(name, group string) error {
 		return fmt.Errorf("create user %s: %w", name, err)
 	}
 	fmt.Printf("created user %s\n", name)
+	return nil
+}
+
+// fixEnvFilePermissions chgrp's the env file to the forge-proxy group
+// and bumps mode to 0640 (group-readable). install.sh writes it as
+// 0600 root:root initially because the group doesn't exist at that
+// point; this is the post-setup fix that lets the forge-proxy user
+// read the file directly (e.g. for ad-hoc `sudo -u forge-proxy
+// forge-proxy admin ...` invocations).
+//
+// Returns nil silently if the env file doesn't exist — the operator
+// may not have installed it yet, or may be using a non-default
+// location via FORGE_PROXY_ENV_FILE. Returns an error only if the
+// file exists but chown/chmod fails.
+func fixEnvFilePermissions(envFile, group string) error {
+	info, err := os.Stat(envFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat env file %s: %w", envFile, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s exists but is not a regular file", envFile)
+	}
+	// chgrp via the OS so the group lookup actually works on this host
+	// (Go's syscall.Chown wants numeric IDs; shelling out lets us pass
+	// the group name and have getpwnam/getgrnam resolve it).
+	if err := runCommand("chgrp", group, envFile); err != nil {
+		return fmt.Errorf("chgrp %s %s: %w", group, envFile, err)
+	}
+	if err := os.Chmod(envFile, 0o640); err != nil {
+		return fmt.Errorf("chmod 0640 %s: %w", envFile, err)
+	}
+	fmt.Printf("fixed permissions on %s (root:%s, mode 0640)\n", envFile, group)
 	return nil
 }
 

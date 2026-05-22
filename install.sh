@@ -14,6 +14,10 @@
 # Env vars:
 #   FORGE_PROXY_VERSION       Release tag (e.g. v0.1.0). Default: latest.
 #   FORGE_PROXY_INSTALL_DIR   Install target. Default: /usr/local/bin.
+#   FORGE_PROXY_ENV_FILE      Where to copy .env.example on first install.
+#                             Default: /etc/forge-proxy.env. Existing files
+#                             are NEVER overwritten — operator secrets are
+#                             always preserved.
 #   FORGE_PROXY_SKIP_VERIFY   Set to "1" to skip checksum verification.
 #                             Not recommended outside of debugging.
 
@@ -21,6 +25,7 @@ set -eu
 
 REPO="forgeutah/forge-proxy"
 INSTALL_DIR="${FORGE_PROXY_INSTALL_DIR:-/usr/local/bin}"
+ENV_FILE="${FORGE_PROXY_ENV_FILE:-/etc/forge-proxy.env}"
 VERSION="${FORGE_PROXY_VERSION:-latest}"
 SKIP_VERIFY="${FORGE_PROXY_SKIP_VERIFY:-0}"
 
@@ -166,11 +171,48 @@ else
     exit 1
 fi
 
+# --- env file template ------------------------------------------------------
+# Drop .env.example at $ENV_FILE on first install so the operator's next
+# step is "edit /etc/forge-proxy.env" and not "find the example, copy it,
+# fix permissions". Mode 0600 + root:root is the safe default — the
+# forge-proxy group doesn't exist yet (created later by `setup systemd`),
+# and systemd reads EnvironmentFile= as root before dropping privileges,
+# so 0600 works for systemd-managed runs. `setup systemd` will bump this
+# to 0640 root:forge-proxy once the group exists, so ad-hoc
+# `sudo -u forge-proxy forge-proxy admin ...` invocations can read it.
+
+ENV_INSTALLED="0"
+if [ ! -f "$TMP/.env.example" ]; then
+    echo "forge-proxy: note: .env.example missing from tarball; skipping env-file install"
+elif [ -f "$ENV_FILE" ]; then
+    echo "forge-proxy: $ENV_FILE already exists; preserving operator config"
+else
+    ENV_DIR="$(dirname "$ENV_FILE")"
+    if [ ! -d "$ENV_DIR" ]; then
+        echo "forge-proxy: env-file directory $ENV_DIR does not exist; skipping" >&2
+        echo "  (set FORGE_PROXY_ENV_FILE to a writable location, e.g.:)" >&2
+        echo "  FORGE_PROXY_ENV_FILE=\"\$HOME/.config/forge-proxy.env\"" >&2
+    elif [ -w "$ENV_DIR" ]; then
+        install -m 0600 "$TMP/.env.example" "$ENV_FILE"
+        ENV_INSTALLED="1"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo install -m 0600 "$TMP/.env.example" "$ENV_FILE"
+        ENV_INSTALLED="1"
+    else
+        echo "forge-proxy: $ENV_DIR is not writable and sudo is not available" >&2
+        echo "  (set FORGE_PROXY_ENV_FILE to a writable location, e.g.:)" >&2
+        echo "  FORGE_PROXY_ENV_FILE=\"\$HOME/.config/forge-proxy.env\"" >&2
+    fi
+fi
+
 # --- post-install ------------------------------------------------------------
 
 INSTALLED_PATH="$INSTALL_DIR/forge-proxy"
 echo
 echo "✓ installed forge-proxy $VERSION to $INSTALLED_PATH"
+if [ "$ENV_INSTALLED" = "1" ]; then
+    echo "✓ wrote env-file template to $ENV_FILE (mode 0600)"
+fi
 echo
 
 # Friendly PATH check — print a hint if the install dir isn't on PATH.
@@ -184,8 +226,22 @@ case ":$PATH:" in
         ;;
 esac
 
-echo "Next steps:"
-echo "  1. Copy .env.example to /etc/forge-proxy.env (or \$HOME/.config/forge-proxy.env)"
-echo "  2. Fill in SLACK_*, UPSTREAMS, PROXY_SECRET (openssl rand -hex 32), etc."
-echo "  3. Run the server:   forge-proxy            # auto-discovers the env file"
-echo "  4. Or admin commands: forge-proxy admin list-users"
+if [ "$ENV_INSTALLED" = "1" ]; then
+    echo "Next steps:"
+    echo "  1. Fill in the env file:"
+    echo "     sudo \$EDITOR $ENV_FILE"
+    echo "     (SLACK_CLIENT_ID/SECRET, SLACK_TEAM_ID, UPSTREAMS, PROXY_SECRET)"
+    echo "     Generate the proxy secret with: openssl rand -hex 32"
+    echo
+    echo "  2. Run as a systemd service:"
+    echo "     sudo forge-proxy setup systemd"
+    echo
+    echo "     ...or run directly:"
+    echo "     forge-proxy            # auto-discovers the env file"
+    echo "     forge-proxy admin list-users"
+else
+    echo "Next steps:"
+    echo "  1. Edit your env file ($ENV_FILE if you had one already)"
+    echo "  2. Run the server:   forge-proxy            # auto-discovers the env file"
+    echo "  3. Or admin commands: forge-proxy admin list-users"
+fi

@@ -92,13 +92,42 @@ nodes on their HTTP ports — every other tailnet member (laptops, admin
 tooling) is explicitly denied. This is the network half of the trust model;
 the proxy secret is the application half.
 
-### 4. Configure environment
+### 4. Install the binary
 
-Copy [`.env.example`](.env.example) to `/etc/forge-proxy.env` on the VM
-and fill in the real values:
+Install with the one-liner — the script detects OS + arch, fetches the
+latest release tarball, verifies the SHA-256 against the published
+`checksums.txt`, puts the binary at `/usr/local/bin/forge-proxy`, AND
+drops `.env.example` at `/etc/forge-proxy.env` (mode `0600`, ready to
+edit). Existing env files are never overwritten, so re-running the
+script after editing is safe.
 
 ```sh
-sudo install -m 600 -o root -g root .env.example /etc/forge-proxy.env
+curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | sh
+```
+
+Pin a version, install user-locally, override the env-file path, or
+skip the checksum verify by setting env vars before piping:
+
+```sh
+# Pin a version
+curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | FORGE_PROXY_VERSION=v0.1.0 sh
+
+# Install to ~/.local/bin + ~/.config/forge-proxy.env (no sudo)
+curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | \
+  FORGE_PROXY_INSTALL_DIR="$HOME/.local/bin" \
+  FORGE_PROXY_ENV_FILE="$HOME/.config/forge-proxy.env" \
+  sh
+```
+
+(If you'd rather not run a `curl | sh`, the [Releases page](https://github.com/forgeutah/forge-proxy/releases)
+lists each platform's tarball and `checksums.txt` for manual install.)
+
+### 5. Configure the environment
+
+`/etc/forge-proxy.env` exists already (install.sh copied it from
+`.env.example`). Edit in your secrets:
+
+```sh
 sudo $EDITOR /etc/forge-proxy.env
 ```
 
@@ -113,32 +142,8 @@ openssl rand -hex 32   # paste into /etc/forge-proxy.env
 See the [environment variables](#environment-variables) section below
 for the full reference.
 
-### 5. Run the binary (default: bare binary + systemd)
-
-Install with the one-liner — the script detects OS + arch, fetches the
-latest release tarball, verifies the SHA-256 against the published
-`checksums.txt`, and puts the binary at `/usr/local/bin/forge-proxy`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | sh
-```
-
-Pin a version, install user-locally, or skip the checksum verify by
-setting env vars before piping:
-
-```sh
-# Pin a version
-curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | FORGE_PROXY_VERSION=v0.1.0 sh
-
-# Install to ~/.local/bin instead
-curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | FORGE_PROXY_INSTALL_DIR="$HOME/.local/bin" sh
-```
-
-(If you'd rather not run a `curl | sh`, the [Releases page](https://github.com/forgeutah/forge-proxy/releases)
-lists each platform's tarball and `checksums.txt` for manual install.)
-
-After install, the binary auto-discovers its env file from this search
-path (first existing wins):
+The binary auto-discovers its env file from this search path (first
+existing wins):
 
 1. `$FORGE_PROXY_ENV_FILE` (explicit override)
 2. `/etc/forge-proxy.env` (system-wide install, recommended)
@@ -148,6 +153,8 @@ path (first existing wins):
 
 `--env-file <path>` still works for explicit overrides; the auto
 discovery only fires when the flag is absent.
+
+### 6. Run the binary
 
 **Run as a daemon under systemd (one command):**
 
@@ -220,8 +227,8 @@ you lose every user record and active session — fresh sign-ins
 re-provision users from Slack, and roles you'd manually granted are
 gone.
 
-If that's an acceptable risk for now, you're done.
-Skip to **6. Verify**. Add Litestream later (see
+If that's an acceptable risk for now, you're done. Skip to **7. Verify**
+below. Add Litestream later (see
 [off-host backup](#off-host-backup-optional-litestream--cloudflare-r2))
 when the data-loss surface grows.
 
@@ -277,7 +284,7 @@ authentication, the org owner needs to go to
 Public** once. After that the workflow keeps pushing to the same
 package and visibility stays public.
 
-### 6. Verify
+### 7. Verify
 
 ```sh
 # Liveness — should print "ok"
