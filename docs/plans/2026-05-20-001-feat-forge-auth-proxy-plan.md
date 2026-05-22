@@ -1,7 +1,7 @@
 ---
 title: "feat: Forge Auth Proxy"
 type: feat
-status: active
+status: completed
 date: 2026-05-20
 deepened: 2026-05-20
 origin: docs/brainstorms/forge-auth-proxy-requirements.md
