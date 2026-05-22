@@ -115,20 +115,39 @@ for the full reference.
 
 ### 5. Run the binary (default: bare binary + systemd)
 
-Download the tarball matching the VM's arch from the
-[Releases page](https://github.com/forgeutah/forge-proxy/releases) and
-install:
+Install with the one-liner — the script detects OS + arch, fetches the
+latest release tarball, verifies the SHA-256 against the published
+`checksums.txt`, and puts the binary at `/usr/local/bin/forge-proxy`:
 
 ```sh
-# Pick linux_amd64 or linux_arm64 to match `uname -m` (x86_64 → amd64,
-# aarch64 → arm64). The linux builds are statically linked — they run on
-# any modern Linux with no glibc/musl dependency.
-curl -fsSL https://github.com/forgeutah/forge-proxy/releases/latest/download/forge-proxy_<version>_linux_amd64.tar.gz | tar -xz
-sudo install -m 755 forge-proxy /usr/local/bin/
-
-# Always verify against checksums.txt on the release page before running
-# anything pulled from the internet.
+curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | sh
 ```
+
+Pin a version, install user-locally, or skip the checksum verify by
+setting env vars before piping:
+
+```sh
+# Pin a version
+curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | FORGE_PROXY_VERSION=v0.1.0 sh
+
+# Install to ~/.local/bin instead
+curl -fsSL https://raw.githubusercontent.com/forgeutah/forge-proxy/main/install.sh | FORGE_PROXY_INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+(If you'd rather not run a `curl | sh`, the [Releases page](https://github.com/forgeutah/forge-proxy/releases)
+lists each platform's tarball and `checksums.txt` for manual install.)
+
+After install, the binary auto-discovers its env file from this search
+path (first existing wins):
+
+1. `$FORGE_PROXY_ENV_FILE` (explicit override)
+2. `/etc/forge-proxy.env` (system-wide install, recommended)
+3. `$XDG_CONFIG_HOME/forge-proxy.env`
+4. `$HOME/.config/forge-proxy.env` (user-level)
+5. `./forge-proxy.env` (CWD, development convenience)
+
+`--env-file <path>` still works for explicit overrides; the auto
+discovery only fires when the flag is absent.
 
 Create the dedicated user + data directory:
 
@@ -139,8 +158,9 @@ sudo chown root:forge-proxy /etc/forge-proxy.env
 sudo chmod 0640 /etc/forge-proxy.env
 ```
 
-Install the systemd unit from [`deploy/forge-proxy.service`](deploy/forge-proxy.service)
-and start it:
+**Run as a daemon under systemd** (the recommended path): install the
+unit from [`deploy/forge-proxy.service`](deploy/forge-proxy.service) and
+start it:
 
 ```sh
 sudo cp deploy/forge-proxy.service /etc/systemd/system/
@@ -149,21 +169,29 @@ sudo systemctl enable --now forge-proxy
 sudo systemctl status forge-proxy
 ```
 
-The unit applies the env file via `EnvironmentFile=`, runs as the
-unprivileged `forge-proxy` user, and locks down the rest of the
-filesystem via the standard systemd hardening directives
+The unit applies `/etc/forge-proxy.env` via systemd's `EnvironmentFile=`
+directive, runs as the unprivileged `forge-proxy` user, and locks down
+the filesystem with the standard hardening set
 (`ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, etc.).
 
-**Ad-hoc invocation** (e.g. one-off admin commands from the same env):
+**Or run it directly** for testing or hosts without systemd:
 
 ```sh
-sudo -u forge-proxy /usr/local/bin/forge-proxy --env-file /etc/forge-proxy.env admin list-users
+# Auto-discovers /etc/forge-proxy.env per the search path above
+forge-proxy
+
+# One-off admin commands from the same env file
+forge-proxy admin list-users
+forge-proxy admin set-roles user@example.com admin,organizer
 ```
 
-The `--env-file` flag is a global option — it works before any
-subcommand. Values already in the process environment win over the file
-(shell beats file), so you can override individual keys for debugging
-without editing `/etc/forge-proxy.env`.
+Values already in the process environment win over the file (shell
+beats file), so you can override individual keys for debugging without
+editing `/etc/forge-proxy.env`:
+
+```sh
+LOG_LEVEL=debug forge-proxy admin list-users
+```
 
 This is enough to run the proxy. The SQLite file at
 `/var/lib/forge-proxy/forge.db` is the source of truth; the persistent

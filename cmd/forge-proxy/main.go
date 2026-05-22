@@ -49,11 +49,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
 		os.Exit(1)
 	}
+	// Two-tier env-file resolution:
+	//   1. --env-file <path> wins outright. Missing file is fatal — the
+	//      operator asked for that specific file.
+	//   2. No --env-file: walk the default search path. First existing file
+	//      wins; "no file found" is fine (process env / systemd
+	//      EnvironmentFile= already populated everything).
 	if envFile != "" {
 		if err := godotenv.Load(envFile); err != nil {
 			fmt.Fprintf(os.Stderr, "forge-proxy: load env file %s: %v\n", envFile, err)
 			os.Exit(1)
 		}
+		// Stash the resolved path so run() / runAdmin() can log it via
+		// slog once logging is initialised. Stderr at this point is too
+		// early — config hasn't loaded yet, slog isn't wired.
+		os.Setenv("FORGE_PROXY_LOADED_ENV_FILE", envFile)
+	} else if found := defaultEnvFilePath(); found != "" {
+		if err := godotenv.Load(found); err != nil {
+			fmt.Fprintf(os.Stderr, "forge-proxy: load env file %s: %v\n", found, err)
+			os.Exit(1)
+		}
+		os.Setenv("FORGE_PROXY_LOADED_ENV_FILE", found)
 	}
 
 	// `forge-proxy admin <sub> [args]` dispatches to the admin CLI; every
@@ -76,6 +92,38 @@ func main() {
 		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// defaultEnvFileCandidates is the search path used when --env-file isn't
+// explicitly passed. Listed in priority order — the first existing file
+// wins. `~` is expanded via os.UserHomeDir() at lookup time.
+//
+// Operators who want a different layout can set --env-file explicitly or
+// override via the FORGE_PROXY_ENV_FILE env var (handled below).
+var defaultEnvFileCandidates = []string{
+	"$FORGE_PROXY_ENV_FILE",          // explicit operator override
+	"/etc/forge-proxy.env",           // system-wide install (preferred)
+	"$XDG_CONFIG_HOME/forge-proxy.env", // XDG-style user config
+	"$HOME/.config/forge-proxy.env",  // legacy user config fallback
+	"./forge-proxy.env",              // CWD (development convenience)
+}
+
+// defaultEnvFilePath returns the first existing path from
+// defaultEnvFileCandidates with env vars expanded, or "" if none exist.
+// Used only when --env-file is not explicitly passed; the explicit flag
+// always wins.
+func defaultEnvFilePath() string {
+	for _, candidate := range defaultEnvFileCandidates {
+		path := os.ExpandEnv(candidate)
+		if path == "" {
+			// Candidate was a single env var that's unset — skip.
+			continue
+		}
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
 }
 
 // extractEnvFileFlag returns args with any `--env-file <path>` /
@@ -116,6 +164,9 @@ func run() error {
 
 	setupLogging(cfg.LogLevel)
 	slog.Info("forge-proxy starting", "listen_addr", cfg.ListenAddr, "log_level", cfg.LogLevel)
+	if loaded := os.Getenv("FORGE_PROXY_LOADED_ENV_FILE"); loaded != "" {
+		slog.Info("loaded env file", "path", loaded)
+	}
 
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	database, err := db.Open(dbCtx, cfg.DBPath)

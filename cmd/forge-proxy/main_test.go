@@ -260,6 +260,80 @@ func TestExtractEnvFileFlag(t *testing.T) {
 	}
 }
 
+// TestDefaultEnvFilePath verifies the auto-discovery walk used when
+// --env-file isn't explicitly passed. The contract:
+//   - FORGE_PROXY_ENV_FILE override wins if it points at an existing file
+//   - First existing candidate in the default search path is returned
+//   - "" returned when no candidate exists (caller falls back to process
+//     env only — matches the systemd EnvironmentFile= case)
+func TestDefaultEnvFilePath(t *testing.T) {
+	dir := t.TempDir()
+	override := dir + "/override.env"
+	if err := os.WriteFile(override, []byte("X=1\n"), 0o600); err != nil {
+		t.Fatalf("write override: %v", err)
+	}
+
+	// HOME-rooted candidate that does NOT exist — should be skipped.
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", dir+"/xdg-does-not-exist")
+
+	t.Run("explicit override wins", func(t *testing.T) {
+		t.Setenv("FORGE_PROXY_ENV_FILE", override)
+		got := defaultEnvFilePath()
+		if got != override {
+			t.Errorf("got %q, want %q", got, override)
+		}
+	})
+
+	t.Run("nonexistent override is skipped", func(t *testing.T) {
+		t.Setenv("FORGE_PROXY_ENV_FILE", "/path/that/does/not/exist")
+		// /etc/forge-proxy.env is the next candidate; the test can't
+		// rely on it existing on the runner. The acceptable answer is
+		// either /etc/forge-proxy.env (if the runner happens to have
+		// one) or "". Both are correct — assert one of them.
+		got := defaultEnvFilePath()
+		if got != "" && got != "/etc/forge-proxy.env" {
+			t.Errorf("unexpected resolved path: %q", got)
+		}
+	})
+
+	t.Run("XDG_CONFIG_HOME candidate", func(t *testing.T) {
+		xdg := dir + "/xdg-config"
+		if err := os.MkdirAll(xdg, 0o700); err != nil {
+			t.Fatalf("mkdir xdg: %v", err)
+		}
+		path := xdg + "/forge-proxy.env"
+		if err := os.WriteFile(path, []byte("Y=1\n"), 0o600); err != nil {
+			t.Fatalf("write xdg env: %v", err)
+		}
+		t.Setenv("FORGE_PROXY_ENV_FILE", "/path/that/does/not/exist")
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+		got := defaultEnvFilePath()
+		// /etc/forge-proxy.env, if present on the runner, would win
+		// over XDG. Accept either.
+		if got != path && got != "/etc/forge-proxy.env" {
+			t.Errorf("expected XDG path %q (or /etc/forge-proxy.env), got %q", path, got)
+		}
+	})
+
+	t.Run("no candidates exist", func(t *testing.T) {
+		t.Setenv("FORGE_PROXY_ENV_FILE", "")
+		t.Setenv("XDG_CONFIG_HOME", "")
+		t.Setenv("HOME", dir+"/no-such-home")
+		// CWD candidate ./forge-proxy.env may exist if a previous test
+		// chdir'd somewhere unusual; chdir back to the temp dir to make
+		// the result deterministic.
+		oldCwd, _ := os.Getwd()
+		_ = os.Chdir(dir)
+		defer os.Chdir(oldCwd)
+		got := defaultEnvFilePath()
+		// /etc/forge-proxy.env may exist on dev machines; accept either.
+		if got != "" && got != "/etc/forge-proxy.env" {
+			t.Errorf("expected no candidate found, got %q", got)
+		}
+	})
+}
+
 // TestEnvFileLoading_EndToEnd writes a temp env file, calls godotenv.Load
 // the same way main() does, and asserts the values land in os.Getenv.
 // Pins the contract that the bare `forge-proxy --env-file <path>` UX
