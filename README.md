@@ -180,21 +180,55 @@ when the data-loss surface grows.
 
 #### Alternative: Docker
 
-If your host runs containers and you'd rather not manage a systemd unit:
+If your host runs containers and you'd rather not manage a systemd unit,
+pull the published image from
+[GitHub Container Registry](https://github.com/forgeutah/forge-proxy/pkgs/container/forge-proxy)
+and run it. The image is multi-arch (linux/amd64 + linux/arm64); docker
+selects the right one automatically.
 
 ```sh
-docker build -t forge-proxy:latest .
+docker pull ghcr.io/forgeutah/forge-proxy:latest
+
 docker run -d \
   --name forge-proxy \
   --restart=unless-stopped \
   -p 8080:8080 \
   -v /var/lib/forge-proxy:/data \
   --env-file /etc/forge-proxy.env \
-  forge-proxy:latest
+  ghcr.io/forgeutah/forge-proxy:latest
 ```
 
 Set `DB_PATH=/data/forge.db` in `/etc/forge-proxy.env` to match the
 volume mount. Everything else is identical.
+
+**Pinning to a specific version** (recommended for production — `latest`
+moves with every merge to `main`):
+
+```sh
+docker pull ghcr.io/forgeutah/forge-proxy:v0.1.0   # exact release
+docker pull ghcr.io/forgeutah/forge-proxy:v0       # rolling major
+docker pull ghcr.io/forgeutah/forge-proxy:sha-abc1234   # exact commit
+```
+
+The [Releases page](https://github.com/forgeutah/forge-proxy/releases)
+also publishes a `checksums.txt` for each tagged release; the image
+digest in `docker pull` output is the equivalent integrity check for
+the container path.
+
+**Building locally** (if you need to customise the image or are working
+air-gapped from GHCR):
+
+```sh
+docker build -t forge-proxy:local .
+# substitute forge-proxy:local for ghcr.io/forgeutah/forge-proxy:latest above
+```
+
+**One-time package visibility** — the first push to GHCR creates the
+package as **private** by default. To make it pullable without
+authentication, the org owner needs to go to
+**Packages → forge-proxy → Package settings → Change visibility →
+Public** once. After that the workflow keeps pushing to the same
+package and visibility stays public.
 
 ### 6. Verify
 

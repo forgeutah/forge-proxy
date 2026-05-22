@@ -1,9 +1,16 @@
 # syntax=docker/dockerfile:1.7
 
 # --- build stage --------------------------------------------------------------
-# Alpine is small enough to pull quickly and ships current Go toolchains. We
-# pin to 1.25 to match the go.mod declared version; bump both in lockstep.
-FROM golang:1.25-alpine AS build
+# Pin --platform to $BUILDPLATFORM (the host running docker buildx) and let
+# Go cross-compile to $TARGETARCH/$TARGETOS. The alternative — emulating the
+# target arch via qemu — works but takes ~5 minutes per arch in CI; native
+# cross-compile from amd64 to arm64 takes ~30s. CGO off makes this free.
+#
+# Alpine is small enough to pull quickly and ships current Go toolchains. Pin
+# to 1.25 to match go.mod; bump both in lockstep.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 
 # Dependency layer: copying go.mod / go.sum first lets the layer cache survive
@@ -12,12 +19,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Source + build. modernc.org/sqlite is pure Go so CGO stays off; the result
-# is a static binary that runs anywhere a Linux kernel does. -trimpath keeps
-# build-host paths out of the binary; -s -w drops the symbol table for a
-# smaller image.
+# is a static binary that runs anywhere the target kernel does. -trimpath
+# keeps build-host paths out of the binary; -s -w drops the symbol table for
+# a smaller image.
 COPY . .
-ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w" -o /out/forge-proxy ./cmd/forge-proxy
+ENV CGO_ENABLED=0
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/forge-proxy ./cmd/forge-proxy
 
 # --- runtime stage ------------------------------------------------------------
 # distroless/static is the smallest possible base for a static Go binary: no
