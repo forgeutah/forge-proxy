@@ -67,15 +67,45 @@ fi
 
 if [ "$VERSION" = "latest" ]; then
     echo "forge-proxy: looking up latest release..."
-    # The /releases/latest endpoint returns JSON with a tag_name field.
-    # sed pulls the value without requiring jq, which isn't universally
-    # installed.
-    LATEST_JSON="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" || true)"
-    if [ -z "$LATEST_JSON" ]; then
-        echo "forge-proxy: failed to fetch latest release info from GitHub API" >&2
+    # Capture both the HTTP status and the body so we can distinguish
+    # "no releases" (404) from network errors / API rate limits.
+    API_URL="https://api.github.com/repos/$REPO/releases/latest"
+    HTTP_RESPONSE="$(curl -sS -w '\nHTTP_STATUS:%{http_code}' "$API_URL" 2>&1)" || {
+        echo "forge-proxy: could not reach $API_URL" >&2
+        echo "  (check your network connection)" >&2
+        exit 1
+    }
+    HTTP_STATUS="$(printf '%s' "$HTTP_RESPONSE" | sed -n 's/^HTTP_STATUS://p' | tail -n 1)"
+    BODY="$(printf '%s' "$HTTP_RESPONSE" | sed '/^HTTP_STATUS:/d')"
+
+    if [ "$HTTP_STATUS" = "404" ]; then
+        echo "forge-proxy: no published release found at github.com/$REPO" >&2
+        echo "" >&2
+        echo "GitHub's /releases/latest returns 404 when there are no" >&2
+        echo "releases at all, OR when every existing release is a draft." >&2
+        echo "If you just tagged a release, check:" >&2
+        echo "  https://github.com/$REPO/releases" >&2
+        echo "and click \"Publish release\" if it's still a draft." >&2
+        echo "" >&2
+        echo "To install a specific version directly:" >&2
+        echo "  curl -fsSL .../install.sh | FORGE_PROXY_VERSION=v0.1.0 sh" >&2
+        echo "(Draft releases are not downloadable without auth — the" >&2
+        echo "release must be published.)" >&2
         exit 1
     fi
-    VERSION="$(printf '%s\n' "$LATEST_JSON" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    if [ "$HTTP_STATUS" = "403" ]; then
+        echo "forge-proxy: GitHub API returned HTTP 403 (rate-limited or auth-required)" >&2
+        echo "Wait a few minutes and retry, or set FORGE_PROXY_VERSION explicitly" >&2
+        echo "to skip the API lookup." >&2
+        exit 1
+    fi
+    if [ "$HTTP_STATUS" != "200" ]; then
+        echo "forge-proxy: GitHub API returned HTTP $HTTP_STATUS" >&2
+        echo "$BODY" | head -n 5 >&2
+        exit 1
+    fi
+
+    VERSION="$(printf '%s\n' "$BODY" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
     if [ -z "$VERSION" ]; then
         echo "forge-proxy: could not parse tag_name from API response" >&2
         exit 1

@@ -87,9 +87,12 @@ changelog:
       - 'Merge branch'
 
 release:
-  # Mark as draft so a human reviews artifacts before publishing. Flip to
-  # false once the cadence is established and you trust the workflow.
-  draft: true
+  # Auto-publish — the curl|sh installer hits /releases/latest, which
+  # ignores drafts. Flip to `draft: true` if you want a human review
+  # step (the artifacts are still produced; you just click Publish in
+  # the GitHub UI after each tag). With auto-publish the operator UX is
+  # one command: `git push origin v0.1.0`.
+  draft: false
   prerelease: auto
   name_template: "v{{.Version}}"
   header: |
