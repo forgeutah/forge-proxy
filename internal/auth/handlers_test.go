@@ -345,6 +345,59 @@ func TestLogin_InvalidReturnToFallsBackToDefault(t *testing.T) {
 // /auth/callback — happy paths
 // ---------------------------------------------------------------------------
 
+// TestCallback_TamperedReturnTo_FallsBackToDefault verifies defense-in-depth
+// return_to re-validation on the callback path. The pre-auth cookie is
+// HttpOnly + __Host- + single-use, which closes the common attack shapes —
+// but the payload is base64(json(...)) with no HMAC, so any cookie-write
+// primitive on the auth host (XSS, future bug) could swap return_to while
+// preserving state/nonce. The callback re-runs Validate; a tampered
+// destination falls back to DefaultLandingURL.
+func TestCallback_TamperedReturnTo_FallsBackToDefault(t *testing.T) {
+	f := newFixture(t)
+
+	// Build a pre-auth payload whose return_to points at a hostile host
+	// the validator rejects. State/nonce are real (so they round-trip
+	// through the OIDC verification), but the destination is the attack
+	// surface we're testing.
+	pre := &PreAuthPayload{
+		State:    "STATE-tampered",
+		Nonce:    "NONCE-tampered",
+		ReturnTo: "https://evil.com/grab-csrf",
+	}
+
+	// Set the cookie directly so we bypass /auth/login's call to Validate.
+	// This is the simulation: an attacker has swapped pre.ReturnTo after
+	// the login redirect but before the callback fires.
+	rec := httptest.NewRecorder()
+	if err := SetPreAuth(rec, pre); err != nil {
+		t.Fatalf("SetPreAuth: %v", err)
+	}
+	cookies := rec.Result().Cookies()
+
+	f.setIDToken(func() (string, int) {
+		claims := standardClaims(f.slack, pre.Nonce, f.cfg.SlackTeamID)
+		return f.slack.signClaims(t, claims), 200
+	})
+
+	cb := f.callback(cookies, pre.State, "stub-code")
+	if cb.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302; body=%q", cb.Code, cb.Body.String())
+	}
+	loc := cb.Header().Get("Location")
+	if loc == "https://evil.com/grab-csrf" {
+		t.Fatalf("redirect honoured tampered return_to — SEC-2 regression: %q", loc)
+	}
+	if loc != f.cfg.DefaultLandingURL {
+		t.Fatalf("redirect = %q; want default landing %q", loc, f.cfg.DefaultLandingURL)
+	}
+
+	// Session was still created (the user authenticated successfully; only
+	// the destination falls back). Sanity-check the session cookie was set.
+	if sc := findCookie(cb, session.CookieName); sc == nil {
+		t.Fatalf("session cookie missing after tampered-return_to callback")
+	}
+}
+
 // TestCallback_HappyPath_CoversAE2_F1 verifies the new-member sign-in:
 // user row created with empty roles, session cookie set on .forgeutah.tech,
 // redirect to the original return_to.

@@ -217,6 +217,70 @@ func TestSmugglingDefense_DuplicateValueAttack(t *testing.T) {
 	}
 }
 
+// TestSmugglingDefense_CookieStrip verifies Layer 4: the forge_session
+// cookie is removed from the outbound Cookie header before forwarding to the
+// upstream. Upstreams authenticate via the X-Forge-* contract; the raw
+// session ID is a bearer credential they have no need to log or replay.
+//
+// Catches the security finding where a curious or compromised upstream
+// could lift the session ID from its access logs and replay it against any
+// other *.forgeutah.tech app or against the auth host.
+func TestSmugglingDefense_CookieStrip(t *testing.T) {
+	r := inboundReq()
+	r.Header.Set("Cookie", "forge_session=secret-bearer; preference=darkmode")
+	u := testUser()
+	stripForgeHeaders(r)
+	injectForgeHeaders(r, "the-real-secret", u)
+
+	got := r.Header.Get("Cookie")
+	if strings.Contains(got, "forge_session") {
+		t.Fatalf("outbound Cookie still contains forge_session: %q", got)
+	}
+	if !strings.Contains(got, "preference=darkmode") {
+		t.Fatalf("outbound Cookie dropped unrelated cookie: %q", got)
+	}
+}
+
+// TestSmugglingDefense_CookieStrip_OnlyForgeSession verifies that when the
+// inbound Cookie header contains ONLY the forge_session cookie, the entire
+// header is removed (no empty Cookie header lingers on the outbound request).
+func TestSmugglingDefense_CookieStrip_OnlyForgeSession(t *testing.T) {
+	r := inboundReq()
+	r.Header.Set("Cookie", "forge_session=only-cookie")
+	u := testUser()
+	stripForgeHeaders(r)
+	injectForgeHeaders(r, "the-real-secret", u)
+
+	if got, ok := r.Header["Cookie"]; ok {
+		t.Fatalf("outbound Cookie header should be absent; got %q", got)
+	}
+}
+
+// TestSmugglingDefense_CookieStrip_MultipleHeaders covers the edge case where
+// clients send Cookie as multiple header values rather than one
+// "; "-separated string. Each value is processed independently.
+func TestSmugglingDefense_CookieStrip_MultipleHeaders(t *testing.T) {
+	r := inboundReq()
+	r.Header["Cookie"] = []string{
+		"forge_session=secret-bearer",
+		"preference=darkmode; locale=en",
+	}
+	u := testUser()
+	stripForgeHeaders(r)
+	injectForgeHeaders(r, "the-real-secret", u)
+
+	values, _ := r.Header["Cookie"]
+	for _, v := range values {
+		if strings.Contains(v, "forge_session") {
+			t.Fatalf("outbound Cookie value still contains forge_session: %q", v)
+		}
+	}
+	joined := strings.Join(values, " ")
+	if !strings.Contains(joined, "preference=darkmode") || !strings.Contains(joined, "locale=en") {
+		t.Fatalf("unrelated cookies dropped; outbound = %q", values)
+	}
+}
+
 // TestNonASCIIName_RFC8187Encoded verifies the X-Forge-Name encoding choice:
 // non-ASCII display names (e.g. emoji-laden Slack profiles) round-trip as
 // RFC 8187 percent-encoded UTF-8 prefixed with "UTF-8''".

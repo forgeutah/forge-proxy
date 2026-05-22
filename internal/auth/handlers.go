@@ -252,7 +252,15 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		"session_id", httplog.SessionID(sess.ID))
 
 	session.Set(w, sess.ID, sess.ExpiresAt, h.Cfg.CookieDomain)
-	http.Redirect(w, r, pre.ReturnTo, http.StatusFound)
+	// Defense-in-depth: re-validate the return_to read from the pre-auth
+	// cookie. The cookie is __Host- + HttpOnly + single-use, which closes
+	// the common attack shapes, but the payload itself is base64(json(...))
+	// with no HMAC — any cookie-write primitive on the auth host (XSS,
+	// future bug) could swap return_to while preserving state/nonce. The
+	// validator is the same one /auth/login uses, so a tampered cookie
+	// falls back to the default landing URL identically.
+	destination := h.resolveReturnTo(pre.ReturnTo)
+	http.Redirect(w, r, destination, http.StatusFound)
 }
 
 // HandleLogout (POST /auth/logout) ends the current session. CSRF defence

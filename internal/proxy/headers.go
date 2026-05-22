@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/forgeutah/forge-proxy/internal/session"
 	"github.com/forgeutah/forge-proxy/internal/user"
 )
 
@@ -117,6 +118,39 @@ func stripForgeHeaders(out *http.Request) {
 	for k := range out.Trailer {
 		if strings.HasPrefix(http.CanonicalHeaderKey(k), forgeHeaderPrefix) {
 			out.Trailer.Del(k)
+		}
+	}
+
+	// Layer 4 — Cookie strip: remove the proxy's own session cookie before
+	// forwarding. Upstreams authenticate via the X-Forge-* headers + the
+	// X-Forge-Proxy-Secret; the raw session ID is a bearer credential they
+	// do not need and have no contract to redact from access logs. Leaving
+	// it in the outbound Cookie header turns every upstream's request log
+	// into a session-impersonation oracle (a compromised or curious
+	// upstream can lift the cookie and replay it against any other
+	// *.forgeutah.tech app or against the auth host).
+	if cookies, ok := out.Header[http.CanonicalHeaderKey("Cookie")]; ok {
+		cleaned := make([]string, 0, len(cookies))
+		for _, header := range cookies {
+			kept := make([]string, 0)
+			// Cookie headers are "; "-separated name=value pairs. Some clients
+			// split across multiple Cookie headers; iterate each value
+			// independently.
+			for entry := range strings.SplitSeq(header, ";") {
+				name, _, _ := strings.Cut(strings.TrimSpace(entry), "=")
+				if name == session.CookieName {
+					continue
+				}
+				kept = append(kept, strings.TrimSpace(entry))
+			}
+			if len(kept) > 0 {
+				cleaned = append(cleaned, strings.Join(kept, "; "))
+			}
+		}
+		if len(cleaned) == 0 {
+			out.Header.Del("Cookie")
+		} else {
+			out.Header["Cookie"] = cleaned
 		}
 	}
 }

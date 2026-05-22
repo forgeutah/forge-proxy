@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -157,6 +158,28 @@ func (o *OIDC) initVerifier(ctx context.Context, issuer string) {
 	}
 }
 
+// jwksPingClient is a dedicated http.Client for JWKS readiness pings with
+// explicit per-stage transport timeouts. Using a dedicated client (rather
+// than http.DefaultClient) keeps the connection pool isolated from the rest
+// of the binary and lets us bound each network stage tighter than the
+// outer context's 30s deadline. A misbehaving JWKS endpoint that
+// established the TCP/TLS connection then dripped response bytes slowly
+// would otherwise hold the connection until context cancellation; the
+// per-stage timeouts cap each failure mode independently.
+var jwksPingClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		IdleConnTimeout:       60 * time.Second,
+		MaxIdleConns:          2,
+	},
+}
+
 // pingJWKS does a single HTTP GET against the JWKS URL with the supplied
 // context. A 200 response is treated as "Slack is serving keys"; anything
 // else triggers a retry. We don't parse the response body — go-oidc's
@@ -166,7 +189,7 @@ func pingJWKS(ctx context.Context, url string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := jwksPingClient.Do(req)
 	if err != nil {
 		return err
 	}
