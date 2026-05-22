@@ -3,7 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -138,11 +138,13 @@ func (o *OIDC) initVerifier(ctx context.Context, issuer string) {
 			default:
 				close(o.keysetReady)
 			}
-			log.Printf("auth: OIDC verifier ready (issuer=%s)", issuer)
+			slog.Info("auth: OIDC verifier ready", "issuer", issuer)
 			return
 		}
 
-		log.Printf("auth: OIDC verifier construction failed (retrying in %s): %v", delay, err)
+		slog.Warn("auth: OIDC verifier construction failed; retrying",
+			"retry_in", delay.String(),
+			"error", err.Error())
 		select {
 		case <-ctx.Done():
 			return

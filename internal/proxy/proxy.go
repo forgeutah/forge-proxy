@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/forgeutah/forge-proxy/internal/config"
+	"github.com/forgeutah/forge-proxy/internal/httplog"
 	"github.com/forgeutah/forge-proxy/internal/session"
 	"github.com/forgeutah/forge-proxy/internal/user"
 )
@@ -92,7 +92,10 @@ func New(cfg *config.Config, sessions SessionStore, users UserStore) *Proxy {
 			// refused, dial timeout, etc.). Application 5xx responses from
 			// the upstream are forwarded unchanged — only network failures
 			// arrive here.
-			log.Printf("proxy: upstream error for %s%s: %v", r.Host, r.URL.RequestURI(), err)
+			httplog.FromContext(r.Context()).Error("proxy: upstream error",
+				"host", r.Host,
+				"path", r.URL.RequestURI(),
+				"error", err.Error())
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 		// FlushInterval=-1 means "flush immediately after each Write" —
@@ -109,6 +112,8 @@ func New(cfg *config.Config, sessions SessionStore, users UserStore) *Proxy {
 // ServeHTTP implements http.Handler. See Proxy doc for the per-request
 // flow.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	logger := httplog.FromContext(r.Context())
+
 	// Step 1: read the session cookie.
 	sessionID, ok := session.Read(r)
 	if !ok {
@@ -121,11 +126,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, session.ErrNotFound):
-			log.Printf("proxy: session not found for cookie on %s%s", r.Host, r.URL.RequestURI())
+			logger.Info("proxy: session not found for cookie",
+				"host", r.Host, "path", r.URL.RequestURI())
 		case errors.Is(err, session.ErrExpired):
-			log.Printf("proxy: session expired for cookie on %s%s", r.Host, r.URL.RequestURI())
+			logger.Info("proxy: session expired for cookie",
+				"host", r.Host, "path", r.URL.RequestURI())
 		default:
-			log.Printf("proxy: session lookup error on %s%s: %v", r.Host, r.URL.RequestURI(), err)
+			logger.Error("proxy: session lookup error",
+				"host", r.Host, "path", r.URL.RequestURI(), "error", err.Error())
 		}
 		p.redirectToLogin(w, r, "session lookup failed")
 		return
@@ -138,12 +146,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	u, err := p.users.Get(r.Context(), sess.UserID)
 	if err != nil {
 		if errors.Is(err, user.ErrNotFound) {
-			log.Printf("proxy: session %s references missing user %d; clearing cookie", redactSessionID(sessionID), sess.UserID)
+			logger.Warn("proxy: session references missing user; clearing cookie",
+				"session_id", httplog.SessionID(sessionID),
+				"user_id", sess.UserID)
 			session.Clear(w, p.cfg.CookieDomain)
 			p.redirectToLogin(w, r, "user missing")
 			return
 		}
-		log.Printf("proxy: user lookup error for user %d: %v", sess.UserID, err)
+		logger.Error("proxy: user lookup error",
+			"user_id", sess.UserID, "error", err.Error())
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -151,7 +162,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Step 4: Touch the session (60s-throttled). Failure is non-fatal —
 	// log and continue per U4's documented contract.
 	if err := p.sessions.Touch(r.Context(), sessionID); err != nil {
-		log.Printf("proxy: session touch failed for user %d: %v (continuing)", sess.UserID, err)
+		logger.Warn("proxy: session touch failed; continuing",
+			"user_id", sess.UserID, "error", err.Error())
 	}
 
 	// Step 5: resolve upstream.
@@ -204,7 +216,8 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 func (p *Proxy) redirectToLogin(w http.ResponseWriter, r *http.Request, reason string) {
 	inbound := "https://" + r.Host + r.URL.RequestURI()
 	loginURL := "https://" + p.cfg.AuthHost + "/auth/login?return_to=" + url.QueryEscape(inbound)
-	log.Printf("proxy: redirecting to login (%s): %s -> %s", reason, inbound, loginURL)
+	httplog.FromContext(r.Context()).Info("proxy: redirecting to login",
+		"reason", reason, "inbound", inbound, "login_url", loginURL)
 	http.Redirect(w, r, loginURL, http.StatusFound)
 }
 
@@ -218,7 +231,7 @@ func (p *Proxy) redirectToLogin(w http.ResponseWriter, r *http.Request, reason s
 // import web) and avoiding the asset-tree wiring just for an error page.
 // A future polish pass might unify these.
 func (p *Proxy) writeUnknownHost(w http.ResponseWriter, r *http.Request) {
-	log.Printf("proxy: unknown host %q", r.Host)
+	httplog.FromContext(r.Context()).Warn("proxy: unknown host", "host", r.Host)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -264,30 +277,3 @@ ul { line-height: 1.6; }
 // over per-request data on the singleton ReverseProxy.
 type upstreamKey struct{}
 type userKey struct{}
-
-// redactSessionID renders a session ID safely for logs: the full ID is a
-// bearer credential, so we log only the leading 6 characters and a length
-// indicator. Once U9 lands the slog redaction the LogValuer approach
-// supersedes this helper.
-func redactSessionID(id string) string {
-	if len(id) <= 6 {
-		return "***"
-	}
-	return id[:6] + "...(" + idLenString(len(id)) + ")"
-}
-
-// idLenString formats a small positive integer without pulling in strconv —
-// avoids one import in the redaction-only path.
-func idLenString(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}

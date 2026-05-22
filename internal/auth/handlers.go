@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 
@@ -12,6 +11,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/forgeutah/forge-proxy/internal/config"
+	"github.com/forgeutah/forge-proxy/internal/httplog"
 	"github.com/forgeutah/forge-proxy/internal/session"
 	"github.com/forgeutah/forge-proxy/internal/user"
 )
@@ -86,14 +86,15 @@ func (h *Handler) IsSignedIn(ctx context.Context, r *http.Request) bool {
 func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	returnTo := h.resolveReturnTo(r.URL.Query().Get("return_to"))
 
+	logger := httplog.FromContext(r.Context())
 	payload, err := NewPreAuth(returnTo)
 	if err != nil {
-		log.Printf("auth/login: generating pre-auth tokens: %v", err)
+		logger.Error("auth/login: generating pre-auth tokens", "error", err.Error())
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
 	if err := SetPreAuth(w, payload); err != nil {
-		log.Printf("auth/login: setting pre-auth cookie: %v", err)
+		logger.Error("auth/login: setting pre-auth cookie", "error", err.Error())
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
@@ -138,12 +139,14 @@ type idTokenClaims struct {
 // ?error=not_in_workspace for the team mismatch) and stops. No partial
 // state ever leaves the handler.
 func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
+	logger := httplog.FromContext(r.Context())
+
 	// Step 1: read pre-auth, then immediately delete. Delete-first
 	// guarantees single-use even if the rest of the handler crashes.
 	pre, preErr := ReadPreAuth(r)
 	ClearPreAuth(w)
 	if preErr != nil {
-		log.Printf("auth/callback: pre-auth read: %v", preErr)
+		logger.Warn("auth/callback: pre-auth read", "error", preErr.Error())
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
@@ -151,7 +154,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Step 2: state constant-time compare.
 	queryState := r.URL.Query().Get("state")
 	if subtle.ConstantTimeCompare([]byte(queryState), []byte(pre.State)) != 1 {
-		log.Printf("auth/callback: state mismatch")
+		logger.Warn("auth/callback: state mismatch")
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
@@ -159,7 +162,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Step 3: verifier readiness.
 	verifier := h.OIDC.Verifier()
 	if verifier == nil {
-		log.Printf("auth/callback: OIDC verifier not ready")
+		logger.Warn("auth/callback: OIDC verifier not ready")
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
@@ -169,13 +172,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// dangling.
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		log.Printf("auth/callback: missing code")
+		logger.Warn("auth/callback: missing code")
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
 	token, err := h.OIDC.OAuth.Exchange(r.Context(), code)
 	if err != nil {
-		log.Printf("auth/callback: token exchange: %v", err)
+		logger.Warn("auth/callback: token exchange", "error", err.Error())
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
@@ -184,13 +187,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// untyped any, so we type-assert to string.
 	rawIDToken, _ := token.Extra(idTokenExtraField).(string)
 	if rawIDToken == "" {
-		log.Printf("auth/callback: token response missing id_token")
+		logger.Warn("auth/callback: token response missing id_token")
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
 	idToken, err := verifier.Verify(r.Context(), rawIDToken)
 	if err != nil {
-		log.Printf("auth/callback: id_token verify: %v", err)
+		logger.Warn("auth/callback: id_token verify", "error", err.Error())
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
@@ -198,19 +201,21 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Step 6: parse claims and verify nonce + team.
 	claims, err := parseClaims(idToken)
 	if err != nil {
-		log.Printf("auth/callback: claims parse: %v", err)
+		logger.Warn("auth/callback: claims parse", "error", err.Error())
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(pre.Nonce)) != 1 {
-		log.Printf("auth/callback: nonce mismatch")
+		logger.Warn("auth/callback: nonce mismatch")
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(claims.SlackTeamID), []byte(h.Cfg.SlackTeamID)) != 1 {
 		// F3 / R3 / R13: user is signed into Slack but with the wrong
 		// workspace. Render the "not in workspace" state — no session.
-		log.Printf("auth/callback: workspace mismatch (claim=%q want=%q)", claims.SlackTeamID, h.Cfg.SlackTeamID)
+		logger.Info("auth/callback: workspace mismatch",
+			"claim_team", claims.SlackTeamID,
+			"want_team", h.Cfg.SlackTeamID)
 		http.Redirect(w, r, h.errorURL(errorQueryNotInWorkspace), http.StatusFound)
 		return
 	}
@@ -230,7 +235,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		AvatarURL:   claims.Picture,
 	})
 	if err != nil {
-		log.Printf("auth/callback: user upsert: %v", err)
+		logger.Error("auth/callback: user upsert", "error", err.Error())
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
@@ -239,10 +244,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 	sess, err := h.Sessions.Create(r.Context(), u.ID, userAgent, ip)
 	if err != nil {
-		log.Printf("auth/callback: session create: %v", err)
+		logger.Error("auth/callback: session create", "error", err.Error(), "user_id", u.ID)
 		http.Redirect(w, r, h.errorURL(errorQueryAuthFailed), http.StatusFound)
 		return
 	}
+	logger.Info("auth/callback: sign-in succeeded",
+		"user_id", u.ID,
+		"session_id", httplog.SessionID(sess.ID))
 
 	session.Set(w, sess.ID, sess.ExpiresAt, h.Cfg.CookieDomain)
 	http.Redirect(w, r, pre.ReturnTo, http.StatusFound)
@@ -255,10 +263,11 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 // the residual risk (sign-out CSRF is low-impact: annoyance, not
 // compromise).
 func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	logger := httplog.FromContext(r.Context())
 	origin := r.Header.Get("Origin")
 	expected := "https://" + h.Cfg.AuthHost
 	if origin == "" || origin != expected {
-		log.Printf("auth/logout: origin mismatch (got=%q want=%q)", origin, expected)
+		logger.Warn("auth/logout: origin mismatch", "got", origin, "want", expected)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -267,7 +276,9 @@ func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		if err := h.Sessions.Delete(r.Context(), id); err != nil {
 			// Failing to delete is logged but the user-visible behaviour is
 			// still "you're signed out" — clear the cookie regardless.
-			log.Printf("auth/logout: session delete: %v", err)
+			logger.Error("auth/logout: session delete",
+				"error", err.Error(),
+				"session_id", httplog.SessionID(id))
 		}
 	}
 	session.Clear(w, h.Cfg.CookieDomain)

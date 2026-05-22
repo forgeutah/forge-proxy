@@ -9,17 +9,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/forgeutah/forge-proxy/internal/auth"
 	"github.com/forgeutah/forge-proxy/internal/config"
 	"github.com/forgeutah/forge-proxy/internal/db"
+	"github.com/forgeutah/forge-proxy/internal/httplog"
 	"github.com/forgeutah/forge-proxy/internal/proxy"
 	"github.com/forgeutah/forge-proxy/internal/session"
 	"github.com/forgeutah/forge-proxy/internal/user"
@@ -28,7 +31,10 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatalf("forge-proxy: %v", err)
+		// Fall back to stderr without slog — slog may not be configured
+		// yet (config load failure happens before setupLogging).
+		fmt.Fprintf(os.Stderr, "forge-proxy: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -38,6 +44,9 @@ func run() error {
 		return err
 	}
 
+	setupLogging(cfg.LogLevel)
+	slog.Info("forge-proxy starting", "listen_addr", cfg.ListenAddr, "log_level", cfg.LogLevel)
+
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	database, err := db.Open(dbCtx, cfg.DBPath)
 	dbCancel()
@@ -46,10 +55,10 @@ func run() error {
 	}
 	defer func() {
 		if err := database.Close(); err != nil {
-			log.Printf("forge-proxy: closing db: %v", err)
+			slog.Error("closing db", "error", err.Error())
 		}
 	}()
-	log.Printf("forge-proxy: db ready at %s", database.Path())
+	slog.Info("db ready", "path", database.Path())
 
 	// Build the auth stack. The OIDC client kicks off a background JWKS
 	// fetch immediately; the binary stays up even if Slack is unreachable.
@@ -64,14 +73,37 @@ func run() error {
 	oidcClient := auth.New(oidcCtx, cfg)
 	authH := auth.NewHandler(cfg, oidcClient, users, sessions)
 
+	// Sweeper: prune expired session rows on a 1-hour cadence. Started
+	// here so it has the same lifecycle as the HTTP server.
+	sweeper := session.NewSweeper(sessions)
+	sweeperCtx, sweeperStop := context.WithCancel(context.Background())
+	defer sweeperStop()
+	var sweeperWG sync.WaitGroup
+	sweeperWG.Go(func() {
+		_ = sweeper.Run(sweeperCtx, session.DefaultSweepInterval)
+	})
+
+	// Rate limiters: in-memory per-IP token buckets. /auth/login at 30/min,
+	// /auth/callback at 5/min. Buckets reset on restart (single-VM v1).
+	loginLimiter := httplog.NewRateLimiter(30)
+	callbackLimiter := httplog.NewRateLimiter(5)
+
 	// authMux serves traffic destined for the auth host
-	// (cfg.AuthHost) — /healthz, the /auth/* routes, and the embedded
-	// login-page asset tree at /. The login page handler runs an
-	// already-signed-in check at "/" and 302s live sessions to the
+	// (cfg.AuthHost) — /healthz, /readyz, the /auth/* routes, and the
+	// embedded login-page asset tree at /. The login page handler runs
+	// an already-signed-in check at "/" and 302s live sessions to the
 	// default landing URL (R13).
 	authMux := http.NewServeMux()
 	authMux.HandleFunc("GET /healthz", healthz)
-	authH.Register(authMux)
+	authMux.Handle("GET /readyz", readyzHandler(database.Writer, database.Reader, oidcClient, sweeper))
+
+	// Register auth routes with per-endpoint rate limits.
+	authMux.Handle("GET /auth/login",
+		httplog.RateLimitMiddleware(loginLimiter, http.HandlerFunc(authH.HandleLogin)))
+	authMux.Handle("GET /auth/callback",
+		httplog.RateLimitMiddleware(callbackLimiter, http.HandlerFunc(authH.HandleCallback)))
+	authMux.HandleFunc("POST /auth/logout", authH.HandleLogout)
+
 	webH := web.NewHandler(authH, web.Config{DefaultLandingURL: cfg.DefaultLandingURL})
 	authMux.Handle("GET /", webH)
 
@@ -87,15 +119,24 @@ func run() error {
 	// configuration. The dispatcher splits on the inbound Host header:
 	// requests for the auth host go to authMux (auth + web), everything
 	// else goes to the proxy. The /healthz endpoint stays scoped to the
-	// auth host — operators target it explicitly. This keeps the routing
-	// rule visible in main and avoids a second ServeMux layer.
-	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// auth host — operators target it explicitly.
+	dispatcher := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hostMatches(r.Host, cfg.AuthHost) {
 			authMux.ServeHTTP(w, r)
 			return
 		}
 		proxyH.ServeHTTP(w, r)
 	})
+
+	// Middleware chain (outermost first):
+	//  1. RequestID — guarantees X-Request-Id on every response and a
+	//     per-request slog.Logger on context for all downstream code.
+	//  2. AccessLog — emits one structured line per request at end.
+	//  3. HSTS — Strict-Transport-Security on every response.
+	//  4. dispatcher — host-based routing to authMux or proxyH.
+	rootHandler := httplog.RequestIDMiddleware(
+		httplog.AccessLogMiddleware(
+			httplog.HSTSMiddleware(dispatcher)))
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -108,7 +149,7 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("forge-proxy listening on %s", cfg.ListenAddr)
+		slog.Info("forge-proxy listening", "addr", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -117,7 +158,7 @@ func run() error {
 
 	select {
 	case <-ctx.Done():
-		log.Print("shutdown signal received")
+		slog.Info("shutdown signal received")
 	case err := <-errCh:
 		return err
 	}
@@ -127,13 +168,96 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
-	log.Print("forge-proxy stopped")
+
+	// Stop the sweeper and wait for it to exit before letting the
+	// deferred db.Close() run. Otherwise the sweeper's in-flight
+	// Sweep transaction could race the writer pool's close.
+	sweeperStop()
+	sweeperWG.Wait()
+
+	slog.Info("forge-proxy stopped")
 	return nil
+}
+
+// setupLogging configures the default slog logger as a JSON handler on
+// stdout with level driven by cfg.LogLevel. The LevelVar wrapper allows
+// future runtime level changes (e.g. via SIGHUP) without reconstructing
+// the handler.
+func setupLogging(logLevel string) {
+	level := new(slog.LevelVar)
+	switch strings.ToLower(strings.TrimSpace(logLevel)) {
+	case "debug":
+		level.Set(slog.LevelDebug)
+	case "warn", "warning":
+		level.Set(slog.LevelWarn)
+	case "error":
+		level.Set(slog.LevelError)
+	default:
+		level.Set(slog.LevelInfo)
+	}
+	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+	slog.SetDefault(slog.New(h))
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
+}
+
+// pinger is the narrow surface readyzHandler needs from each DB pool.
+// Defining it locally keeps main_test.go able to construct a stub /readyz
+// without spinning up a real SQLite database.
+type pinger interface {
+	PingContext(ctx context.Context) error
+}
+
+// readinessOIDC is the narrow OIDC surface readyzHandler needs.
+type readinessOIDC interface {
+	IsReady() bool
+}
+
+// readinessSweeper is the narrow Sweeper surface readyzHandler needs.
+type readinessSweeper interface {
+	LastSuccess() time.Time
+}
+
+// readyzHandler reports readiness. 200 if all checks pass; 503 with a
+// plain-text body naming the failing check(s) otherwise.
+//
+// Checks:
+//   - writer DB ping (catches "WAL volume gone" / "schema not migrated")
+//   - reader DB ping (catches "reader pool died independently")
+//   - OIDC verifier ready (Slack JWKS fetched at least once)
+//   - sweeper staleness — only enforced if the sweeper has previously
+//     succeeded. Zero-valued LastSuccess means "still on the first sweep
+//     after startup," which is fine; we don't want /readyz to fail
+//     during the first interval of life. The sweeper kicks off an
+//     immediate first sweep in Run, so LastSuccess populates within a
+//     few ms of startup in the happy path.
+func readyzHandler(writer, reader pinger, oidcClient readinessOIDC, sweeper readinessSweeper) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var problems []string
+		if err := writer.PingContext(r.Context()); err != nil {
+			problems = append(problems, fmt.Sprintf("writer db: %v", err))
+		}
+		if err := reader.PingContext(r.Context()); err != nil {
+			problems = append(problems, fmt.Sprintf("reader db: %v", err))
+		}
+		if !oidcClient.IsReady() {
+			problems = append(problems, "oidc: JWKS not yet fetched from Slack")
+		}
+		if last := sweeper.LastSuccess(); !last.IsZero() && time.Since(last) > 2*time.Hour {
+			problems = append(problems, fmt.Sprintf("sweeper: last successful run was %s ago", time.Since(last)))
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if len(problems) > 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, strings.Join(problems, "\n")+"\n")
+			return
+		}
+		_, _ = io.WriteString(w, "ready\n")
+	})
 }
 
 // hostMatches compares an inbound Host header against the configured auth
