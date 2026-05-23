@@ -1,6 +1,22 @@
 /* global React, StateContent, ForgeMark */
 /* eslint-disable no-unused-vars */
 
+// formatBuild turns the meResponse.build payload into a short display
+// string. Tagged release ("0.1.2") gets a "v" prefix; an untagged local
+// build ("dev") shows the commit suffix if available so engineers can
+// tell at a glance which working tree is running. Empty build (e.g.
+// /auth/me fetch failed) falls back to an unobtrusive em-dash so the
+// chrome doesn't flash blank during the initial paint.
+function formatBuild(build) {
+  if (!build || !build.version) return '—';
+  if (build.version === 'dev') {
+    if (build.commit) return 'dev (' + build.commit + (build.dirty ? '*' : '') + ')';
+    return 'dev';
+  }
+  return 'v' + build.version + (build.dirty ? '*' : '');
+}
+Object.assign(window, { formatBuild });
+
 // =====================================================================
 // Forge Auth Proxy — card variant
 //
@@ -13,12 +29,13 @@
 // owns the connecting/success transitions via redirects.
 // =====================================================================
 
-function VariantCard({ flow, host, withAscii }) {
+function VariantCard({ flow, host, withAscii, build }) {
+  const buildLabel = formatBuild(build);
   return (
     <div className="auth-stage">
       <div className="auth-dotgrid" />
       <div className="auth-glow" />
-      <TopBar />
+      <TopBar build={build} />
       <div className="auth-main">
         <div className={`va-card ${withAscii ? 'with-ascii' : ''}`}>
           <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
@@ -26,7 +43,7 @@ function VariantCard({ flow, host, withAscii }) {
               <ForgeMark size={32} />
               <div>
                 <div className="text">forge<span className="accent">/</span>auth</div>
-                <span className="sub">proxy · v1.4.0</span>
+                <span className="sub">proxy · {buildLabel}</span>
               </div>
             </div>
             <span className="pill idle"><span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--term-green)', boxShadow: '0 0 6px var(--term-green)' }} /> healthy</span>
@@ -59,14 +76,14 @@ function VariantCard({ flow, host, withAscii }) {
 }
 
 // ── Shared top/bottom chrome ────────────────────────────────────────────────
-function TopBar() {
+function TopBar({ build }) {
   return (
     <div className="auth-topbar">
       <span /> {/* spacer to keep meta right-aligned */}
       <div className="meta">
         <span className="stat"><span className="dot" /> all systems normal</span>
         <span style={{ color: 'var(--fg-disabled)' }}>·</span>
-        <span>auth-proxy v1.4.0</span>
+        <span>auth-proxy {formatBuild(build)}</span>
       </div>
     </div>
   );
@@ -102,11 +119,12 @@ function FootBar() {
 function VariantPortal({ me }) {
   const apps = me.apps || [];
   const tags = me.tags || [];
+  const build = me.build;
   return (
     <div className="auth-stage">
       <div className="auth-dotgrid" />
       <div className="auth-glow" />
-      <TopBar />
+      <TopBar build={build} />
       <div className="auth-main">
         <div className="va-card">
           <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
@@ -114,7 +132,7 @@ function VariantPortal({ me }) {
               <ForgeMark size={32} />
               <div>
                 <div className="text">forge<span className="accent">/</span>auth</div>
-                <span className="sub">signed in</span>
+                <span className="sub">signed in · {formatBuild(build)}</span>
               </div>
             </div>
             <span className="pill idle"><span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--term-green)', boxShadow: '0 0 6px var(--term-green)' }} /> session live</span>

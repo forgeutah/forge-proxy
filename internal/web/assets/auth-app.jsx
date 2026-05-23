@@ -96,7 +96,7 @@ function AuthApp() {
     countdown: 0,
     startConnecting,
   };
-  return <VariantCard flow={flow} host={displayHost} withAscii={true} />;
+  return <VariantCard flow={flow} host={displayHost} withAscii={true} build={me ? me.build : null} />;
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<AuthApp />);

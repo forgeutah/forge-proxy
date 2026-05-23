@@ -10,6 +10,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 
+	"github.com/forgeutah/forge-proxy/internal/buildinfo"
 	"github.com/forgeutah/forge-proxy/internal/config"
 	"github.com/forgeutah/forge-proxy/internal/httplog"
 	"github.com/forgeutah/forge-proxy/internal/session"
@@ -75,16 +76,20 @@ func (h *Handler) Mount(mux *http.ServeMux, opts MountOptions) {
 // React app on mount to decide between the sign-in card and the
 // signed-in portal. Field tags use snake_case to match the JS side.
 type meResponse struct {
-	SignedIn  bool        `json:"signed_in"`
-	Name      string      `json:"name,omitempty"`
-	Email     string      `json:"email,omitempty"`
-	AvatarURL string      `json:"avatar_url,omitempty"`
+	SignedIn  bool   `json:"signed_in"`
+	Name      string `json:"name,omitempty"`
+	Email     string `json:"email,omitempty"`
+	AvatarURL string `json:"avatar_url,omitempty"`
 	// Tags surfaces the user's roles (admin, founder, etc.) so the
 	// portal can render them as chips. Named "tags" in the JSON
 	// because that's how the UI labels them — operators set them via
 	// the admin CLI as "roles", but end users see them as tags.
 	Tags []string    `json:"tags,omitempty"`
 	Apps []meAppInfo `json:"apps,omitempty"`
+	// Build is always populated (even for signed-out callers) so the
+	// React app can display the running binary's version in the footer
+	// without a separate fetch. See internal/buildinfo for provenance.
+	Build buildinfo.Info `json:"build"`
 }
 
 type meAppInfo struct {
@@ -111,7 +116,7 @@ func (h *Handler) HandleMe(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 
-	resp := meResponse{SignedIn: false}
+	resp := meResponse{SignedIn: false, Build: buildinfo.Get()}
 
 	id, ok := session.Read(r)
 	if !ok {

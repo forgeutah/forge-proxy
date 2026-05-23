@@ -29,6 +29,11 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      # Inject the tag (e.g. "v0.1.2") into the buildinfo package so the
+      # running binary can self-report its version via /auth/me. Local
+      # `go build` skips this and falls back to debug.ReadBuildInfo for
+      # the VCS commit + dirty flag.
+      - -X github.com/forgeutah/forge-proxy/internal/buildinfo.Version={{.Version}}
     goos:
       - linux
       - darwin
