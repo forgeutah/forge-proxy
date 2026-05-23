@@ -57,6 +57,71 @@ The trust model has two layers:
 
 ---
 
+## Upstream-app contract
+
+If you're building an app that lives behind forge-proxy, this is the
+contract you implement. The proxy injects nine `X-Forge-*` headers on
+every authenticated request. Your app validates the shared secret, then
+treats the other headers as the authoritative identity of the caller —
+no separate auth, no session cookies, no token exchange.
+
+### Headers your app receives
+
+| Header | Type | Example | Notes |
+| --- | --- | --- | --- |
+| `X-Forge-Proxy-Secret` | string | `9f3a…` (hex) | Validate this first; reject the request if missing or wrong. Compare in constant time. |
+| `X-Forge-Contract-Version` | int | `1` | Bumped on a breaking change to this table. Apps may pin a major version. |
+| `X-Forge-User-Id` | int | `42` | Stable integer primary key. Survives email and Slack workspace changes. Use this as the foreign key in your DB, not the email. |
+| `X-Forge-Email` | string | `alice@example.com` | Slack-verified. Refreshed on every sign-in. |
+| `X-Forge-Name` | string | `Alice` or `UTF-8''Al%C3%ADce` | Display name. Pure-ASCII passes through verbatim. Non-ASCII (emoji, accents) is RFC 8187 encoded as `UTF-8''<percent-encoded>`. Most apps can display either form as-is; if you need to decode, the standard "strip the `UTF-8''` prefix and percent-decode" pipeline works. |
+| `X-Forge-Avatar` | URL | `https://avatars.slack-edge.com/…` | Slack profile image. Safe to render directly. |
+| `X-Forge-Roles` | csv | `admin,founder` | Comma-separated. Empty string means no roles. Roles are user-defined — managed via `forge-proxy admin set-roles`. Treat as opaque tags and define your own authorization rules on top. |
+| `X-Forge-Slack-User-Id` | string | `U0R7G…` | The Slack user ID. Useful if you call the Slack API on the user's behalf. |
+| `X-Forge-Slack-Team-Id` | string | `T0R7G…` | The Slack workspace ID. The proxy already enforces a single configured workspace, but apps can double-check. |
+
+### Validating in your app
+
+Minimal middleware shape, in any language:
+
+```text
+secret := request.header("X-Forge-Proxy-Secret")
+if secret == "" || !constantTimeEqual(secret, env.PROXY_SECRET):
+    return 401  // or 403, or hang up — your call
+
+user := {
+    id:    int(request.header("X-Forge-User-Id")),
+    email: request.header("X-Forge-Email"),
+    name:  request.header("X-Forge-Name"),
+    roles: request.header("X-Forge-Roles").split(","),
+    // etc.
+}
+// Now proceed; user is authenticated.
+```
+
+Use a constant-time comparison (`hmac.Equal` in Go, `secrets.compare_digest` in Python, `crypto.timingSafeEqual` in Node) — a regular string `==` leaks the secret one byte at a time under timing attack.
+
+### Why you don't have to defend against spoofed headers
+
+Before injection, the proxy performs a three-layer strip on every inbound request:
+
+1. Everything listed in the client's `Connection:` header (RFC hop-by-hop)
+2. Everything listed in `X-Forwarded-Forge-Headers` (explicit denylist hook)
+3. *Any* header whose canonical name starts with `X-Forge-` (catch-all)
+
+So a client that sends `X-Forge-Roles: admin` from their browser has those bytes deleted before your app ever sees them. The nine values your app receives come from the proxy's authenticated session lookup, not from the client.
+
+The Tailscale network layer means a client also can't bypass the proxy and hit your app directly with handcrafted headers — the upstream origin isn't reachable from the public internet. The `X-Forge-Proxy-Secret` check is belt-and-braces against a future ACL misconfiguration.
+
+### Logging out
+
+The proxy owns sessions. To sign a user out from your app's perspective, link or redirect to `https://auth.<base-domain>/` and have them click "Sign out" in the portal. There's no `/logout` for upstream apps to call — sessions are server-side and opaque to your app.
+
+### Versioning
+
+`X-Forge-Contract-Version` is `1` today. Future bumps stay additive unless this header changes — apps that want to pin can branch on it. The full contract is normative: apps that deviate break the trust model.
+
+---
+
 ## First-time deploy
 
 ### 1. Slack app
@@ -599,29 +664,6 @@ calendar-reminder the renewal at the 60-day mark.
 
 A re-issued key carries the same `tag:forge-proxy` tag and slots in as a
 drop-in replacement.
-
----
-
-## Upstream-app contract
-
-Each upstream app implements the
-[Upstream-App Contract](docs/plans/2026-05-20-001-feat-forge-auth-proxy-plan.md#upstream-app-contract)
-documented in the plan. The contract is normative — apps that deviate
-break the trust model.
-
-Summary (the full header reference table is in the plan):
-
-- **Reject** any request that lacks a valid `X-Forge-Proxy-Secret`. Return
-  `401 Unauthorized`.
-- **Trust** the rest of the `X-Forge-*` headers only after the secret
-  check passes.
-- **Key persistent records on `X-Forge-User-Id`** (stable integer), not on
-  `X-Forge-Email` (may change between sign-ins).
-- **Do not implement a separate sign-out endpoint.** App "Sign out" links
-  to `POST https://auth.forgeutah.tech/auth/logout`.
-- **Branch on `X-Forge-Contract-Version` if you care about evolution.** v1
-  is the only version today; future versions stay additive unless this
-  header bumps.
 
 ---
 
