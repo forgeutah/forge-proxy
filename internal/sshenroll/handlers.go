@@ -206,6 +206,13 @@ func (h *Handlers) EnrollURL(token string) string {
 	return "https://" + h.AuthHost + "/ssh/enroll/" + url.PathEscape(token)
 }
 
+// Mint forwards to the underlying token store. Exposing it on Handlers
+// (instead of asking callers to reach into Tokens directly) lets the SSH
+// server depend on a single small interface rather than the full store.
+func (h *Handlers) Mint(fingerprint, keyType string, publicKey []byte) (string, error) {
+	return h.Tokens.Mint(fingerprint, keyType, publicKey)
+}
+
 func (h *Handlers) writeInvalidLink(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
