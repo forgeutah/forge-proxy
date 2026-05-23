@@ -7,6 +7,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/joho/godotenv v1.5.1
 	github.com/pressly/goose/v3 v3.27.1
+	golang.org/x/crypto v0.52.0
 	golang.org/x/oauth2 v0.36.0
 	modernc.org/sqlite v1.50.1
 )
