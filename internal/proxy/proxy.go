@@ -60,10 +60,17 @@ type Proxy struct {
 	users        UserStore
 	reverseProxy *httputil.ReverseProxy
 
-	// loginURLPrefix is the precomputed "https://<AuthHost>/auth/login?return_to="
+	// loginURLPrefix is the precomputed "https://<AuthHost>/?return_to="
 	// prefix. The inbound URL is appended via url.QueryEscape on each unauth
 	// request — most authenticated traffic doesn't hit this path, but the
 	// computation is one-shot at startup either way.
+	//
+	// We redirect to the auth host root (the stylized React card) rather
+	// than directly to /auth/login. The card preserves return_to in its
+	// "Continue with Slack" button so the user gets a branded landing page
+	// before the Slack OAuth handoff — important because OAuth consent
+	// screens from a cold link look phishy without context. The card's
+	// JS forwards return_to to /auth/login on click.
 	loginURLPrefix string
 }
 
@@ -78,7 +85,7 @@ func New(cfg *config.Config, sessions SessionStore, users UserStore) *Proxy {
 		hosts:          NewHostMap(cfg.UpstreamMap),
 		sessions:       sessions,
 		users:          users,
-		loginURLPrefix: "https://" + cfg.AuthHost + "/auth/login?return_to=",
+		loginURLPrefix: "https://" + cfg.AuthHost + "/?return_to=",
 	}
 
 	p.reverseProxy = &httputil.ReverseProxy{
@@ -120,6 +127,19 @@ func New(cfg *config.Config, sessions SessionStore, users UserStore) *Proxy {
 // flow.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logger := httplog.FromContext(r.Context())
+
+	// Step 0: resolve upstream up-front. If the inbound Host isn't in the
+	// upstream map, there's nothing to protect — return the branded 404
+	// immediately rather than bouncing the user through auth only to land
+	// on this same page after sign-in. The previous order (auth, then
+	// host) had a nasty local-dev failure mode: hitting `localhost:8083`
+	// without a session would 302 to the configured AUTH_HOST (often the
+	// production auth host), sucking the user into the wrong environment.
+	upstream, ok := p.hosts.Resolve(r.Host)
+	if !ok {
+		p.writeUnknownHost(w, r)
+		return
+	}
 
 	// Step 1: read the session cookie.
 	sessionID, ok := session.Read(r)
@@ -171,13 +191,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := p.sessions.Touch(r.Context(), sessionID); err != nil {
 		logger.Warn("proxy: session touch failed; continuing",
 			"user_id", sess.UserID, "error", err.Error())
-	}
-
-	// Step 5: resolve upstream.
-	upstream, ok := p.hosts.Resolve(r.Host)
-	if !ok {
-		p.writeUnknownHost(w, r)
-		return
 	}
 
 	// Stash the upstream and user on the request context so the Rewrite

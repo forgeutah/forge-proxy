@@ -288,8 +288,8 @@ func TestProxy_Unauthenticated_RedirectsToLogin(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusFound)
 	}
 	loc := w.Header().Get("Location")
-	if !strings.HasPrefix(loc, "https://auth.forgeutah.tech/auth/login?return_to=") {
-		t.Fatalf("Location = %q, want auth-host login prefix", loc)
+	if !strings.HasPrefix(loc, "https://auth.forgeutah.tech/?return_to=") {
+		t.Fatalf("Location = %q, want auth-host root prefix", loc)
 	}
 	// The return_to must be the full inbound URL, URL-encoded.
 	u, err := url.Parse(loc)
@@ -421,8 +421,9 @@ func TestProxy_ExpiredSession_RedirectsToLogin(t *testing.T) {
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusFound)
 	}
-	if !strings.Contains(w.Header().Get("Location"), "/auth/login?return_to=") {
-		t.Fatalf("Location = %q, want login redirect", w.Header().Get("Location"))
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, "https://auth.forgeutah.tech/?return_to=") {
+		t.Fatalf("Location = %q, want auth-host root redirect", loc)
 	}
 }
 

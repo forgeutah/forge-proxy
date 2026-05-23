@@ -82,39 +82,54 @@ func NewHandler(checker SessionChecker, cfg Config) http.Handler {
 // withSecurityHeaders applies the doc-review SEC headers to every
 // response served from the embedded asset tree.
 //
-// CSP rationale:
+// CSP rationale — this policy is intentionally more permissive than a
+// pre-bundled SPA would need. The cost is the no-build-step decision
+// recorded in "Key Technical Decisions → Login page distribution":
+// Babel-standalone runs at page load, XHRs the .jsx sources from the
+// same origin, transpiles them, and injects the result as INLINE
+// <script> blocks. Plus the React app uses style={{...}} props which
+// React renders as inline style="..." attributes. Plus we pull Google
+// Fonts. Each of those drives one widening below.
+//
 //   - `default-src 'none'`: deny-by-default; every resource class must be
 //     allow-listed explicitly below.
-//   - `script-src 'self' https://unpkg.com 'unsafe-eval'`: the embedded
-//     scripts are same-origin (auth-app.jsx, auth-core.jsx,
-//     auth-variants.jsx); the React/ReactDOM/Babel runtimes load from
-//     unpkg with SRI hashes pinned in index.html. The `'unsafe-eval'`
-//     widening is the cost of the no-build-step decision recorded in
-//     "Key Technical Decisions → Login page distribution": Babel-standalone
-//     transpiles JSX at runtime via eval. The SRI hash on Babel and the
-//     `'none'` connect-src below contain the blast radius — even if a
-//     CDN were compromised, the integrity check fails closed and no XHR
-//     escape hatch exists.
-//   - `style-src 'self'`: only the bundled stylesheets.
+//   - `script-src 'self' https://unpkg.com 'unsafe-eval' 'unsafe-inline'`:
+//     same-origin scripts (auth-app.jsx etc.), the React/ReactDOM/Babel
+//     runtimes from unpkg with SRI hashes pinned in index.html,
+//     `'unsafe-eval'` for Babel's runtime JSX transform, and
+//     `'unsafe-inline'` because Babel re-injects the transformed code as
+//     an inline <script>. SRI on the unpkg scripts is the meaningful
+//     containment that survives this widening.
+//   - `style-src 'self' https://fonts.googleapis.com 'unsafe-inline'`:
+//     bundled stylesheets, the Google Fonts stylesheet referenced by
+//     index.html, and `'unsafe-inline'` for React's style={{...}} prop
+//     output (rendered to DOM as `style="..."` attributes).
+//   - `font-src 'self' https://fonts.gstatic.com`: the actual font files
+//     fetched by the Google Fonts stylesheet.
 //   - `img-src 'self' data:`: bundled images plus inline `data:` images
 //     (the React SVGs in auth-core/auth-variants).
-//   - `connect-src 'none'`: the login page makes NO fetch / XHR / WebSocket
-//     calls. Sign-in proceeds through a top-level navigation to
-//     /auth/login; the React app reads its state from the URL query.
-//     Locking connect-src down is a meaningful narrowing.
+//   - `connect-src 'self'`: Babel XHRs `/auth-core.jsx`, `/auth-app.jsx`,
+//     `/auth-variants.jsx` from the same origin to fetch their source
+//     before transpiling. Same-origin only — no cross-origin escape.
 //   - `frame-ancestors 'none'` + `X-Frame-Options: DENY`: clickjacking
 //     defence on the auth origin.
 //   - `base-uri 'self'`: defence against `<base>`-tag injection redirecting
 //     relative URLs.
 //
+// Future work: an esbuild bundling step would let us drop
+// `'unsafe-eval'`, `'unsafe-inline'` on script-src, and the broad
+// connect-src, returning the policy to something closer to the
+// pre-Babel target. That's deferred.
+//
 // We set the CSP on every response (HTML and non-HTML) so a mis-typed
 // JSX served as text/html by some hostile intermediary still gets the
 // same containment.
 const cspPolicy = "default-src 'none'; " +
-	"script-src 'self' https://unpkg.com 'unsafe-eval'; " +
-	"style-src 'self'; " +
+	"script-src 'self' https://unpkg.com 'unsafe-eval' 'unsafe-inline'; " +
+	"style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; " +
+	"font-src 'self' https://fonts.gstatic.com; " +
 	"img-src 'self' data:; " +
-	"connect-src 'none'; " +
+	"connect-src 'self'; " +
 	"frame-ancestors 'none'; " +
 	"base-uri 'self'"
 
