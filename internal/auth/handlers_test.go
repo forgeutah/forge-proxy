@@ -206,7 +206,7 @@ func newFixture(t *testing.T) *testFixture {
 
 	handler := NewHandler(cfg, o, users, sessions)
 	mux := http.NewServeMux()
-	handler.Register(mux)
+	handler.Mount(mux, MountOptions{})
 
 	return &testFixture{t: t, slack: slack, cfg: cfg, handler: handler, mux: mux, dbobj: d}
 }

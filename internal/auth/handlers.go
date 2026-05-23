@@ -43,18 +43,30 @@ func NewHandler(cfg *config.Config, o *OIDC, users *user.Store, sessions *sessio
 	return &Handler{Cfg: cfg, OIDC: o, Users: users, Sessions: sessions}
 }
 
-// Register wires the three /auth/* routes onto the supplied mux. The
-// already-signed-in check at GET /{$} is owned by internal/web (U7) —
-// keeping the root route there lets the web layer own asset serving and
-// the session-redirect compose cleanly without circular imports.
-//
-// The proxy host routing (U8) will eventually differentiate auth-host
-// paths from upstream-app paths, but for U6 every route serves regardless
-// of host — the binary listens on a single port and the mux dispatches
-// by path.
-func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /auth/login", h.HandleLogin)
-	mux.HandleFunc("GET /auth/callback", h.HandleCallback)
+// MountOptions configures per-route middleware applied by Mount. A nil
+// limiter skips rate limiting for that route — fine in tests, never in
+// production (main.go must always pass real limiters).
+type MountOptions struct {
+	LoginLimiter    *httplog.RateLimiter
+	CallbackLimiter *httplog.RateLimiter
+}
+
+// Mount wires every /auth/* route onto mux. This is the single source
+// of truth for auth-route registration — both production (cmd/forge-proxy)
+// and tests call it. Adding a new route here means it appears in both
+// the running binary and the test fixture, which prevents the
+// "registered in tests, 404s in prod" trap.
+func (h *Handler) Mount(mux *http.ServeMux, opts MountOptions) {
+	var login http.Handler = http.HandlerFunc(h.HandleLogin)
+	if opts.LoginLimiter != nil {
+		login = httplog.RateLimitMiddleware(opts.LoginLimiter, login)
+	}
+	var callback http.Handler = http.HandlerFunc(h.HandleCallback)
+	if opts.CallbackLimiter != nil {
+		callback = httplog.RateLimitMiddleware(opts.CallbackLimiter, callback)
+	}
+	mux.Handle("GET /auth/login", login)
+	mux.Handle("GET /auth/callback", callback)
 	mux.HandleFunc("POST /auth/logout", h.HandleLogout)
 	mux.HandleFunc("GET /auth/me", h.HandleMe)
 }

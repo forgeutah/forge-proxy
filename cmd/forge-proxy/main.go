@@ -321,12 +321,14 @@ func run() error {
 	authMux.HandleFunc("GET /healthz", healthz)
 	authMux.Handle("GET /readyz", readyzHandler(database.Writer, database.Reader, oidcClient, sweeper))
 
-	// Register auth routes with per-endpoint rate limits.
-	authMux.Handle("GET /auth/login",
-		httplog.RateLimitMiddleware(loginLimiter, http.HandlerFunc(authH.HandleLogin)))
-	authMux.Handle("GET /auth/callback",
-		httplog.RateLimitMiddleware(callbackLimiter, http.HandlerFunc(authH.HandleCallback)))
-	authMux.HandleFunc("POST /auth/logout", authH.HandleLogout)
+	// Mount auth routes via the single source of truth in package auth.
+	// Per-endpoint rate limits ride along via MountOptions. Adding a new
+	// route is a one-line change in auth.Handler.Mount — it then shows
+	// up in both the running binary and the test fixture automatically.
+	authH.Mount(authMux, auth.MountOptions{
+		LoginLimiter:    loginLimiter,
+		CallbackLimiter: callbackLimiter,
+	})
 
 	webH := web.NewHandler()
 	authMux.Handle("GET /", webH)
