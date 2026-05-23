@@ -328,7 +328,7 @@ func run() error {
 		httplog.RateLimitMiddleware(callbackLimiter, http.HandlerFunc(authH.HandleCallback)))
 	authMux.HandleFunc("POST /auth/logout", authH.HandleLogout)
 
-	webH := web.NewHandler(authH, web.Config{DefaultLandingURL: cfg.DefaultLandingURL})
+	webH := web.NewHandler()
 	authMux.Handle("GET /", webH)
 
 	// proxyH is the reverse-proxy hot path for every non-auth-host

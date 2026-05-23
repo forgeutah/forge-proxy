@@ -91,4 +91,74 @@ function FootBar() {
   );
 }
 
-Object.assign(window, { VariantCard, TopBar, FootBar });
+// =====================================================================
+// Forge Auth Proxy — portal variant
+//
+// Rendered when /auth/me returns signed_in=true and there's no error
+// query param. Shows the user's identity + a list of configured
+// upstream apps + a sign-out form (POST /auth/logout, same-origin so
+// the server's Origin check passes without a CSRF token).
+// =====================================================================
+function VariantPortal({ me }) {
+  const apps = me.apps || [];
+  return (
+    <div className="auth-stage">
+      <div className="auth-dotgrid" />
+      <div className="auth-glow" />
+      <TopBar />
+      <div className="auth-main">
+        <div className="va-card">
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+            <div className="logo-row">
+              <ForgeMark size={32} />
+              <div>
+                <div className="text">forge<span className="accent">/</span>auth</div>
+                <span className="sub">signed in</span>
+              </div>
+            </div>
+            <span className="pill idle"><span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--term-green)', boxShadow: '0 0 6px var(--term-green)' }} /> session live</span>
+          </div>
+
+          <div>
+            <span className="eyebrow">welcome</span>
+            <h1 style={{ marginTop: 8 }}>{me.name || 'Forge member'}</h1>
+            <p className="lede">
+              {me.email
+                ? <>You're signed in as <code style={{ color: 'var(--term-cyan)', background: 'transparent', fontFamily: 'var(--font-mono)' }}>{me.email}</code>. Pick an app below or open one in a new tab.</>
+                : <>You're signed in. Pick an app below or open one in a new tab.</>}
+            </p>
+          </div>
+
+          {apps.length > 0 ? (
+            <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {apps.map(app => (
+                <li key={app.host}>
+                  <a href={app.url} className="btn-ghost" style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    padding: '12px 14px', textDecoration: 'none',
+                  }}>
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{app.host}</span>
+                    <span style={{ color: 'var(--fg-dim)', fontSize: 12 }}>open →</span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p style={{ color: 'var(--fg-dim)', fontSize: 13, margin: 0 }}>
+              No apps are configured on this proxy yet.
+            </p>
+          )}
+
+          <form method="POST" action="/auth/logout" style={{ marginTop: 8 }}>
+            <button type="submit" className="btn-ghost" style={{ padding: '10px 14px', fontSize: 12 }}>
+              Sign out
+            </button>
+          </form>
+        </div>
+      </div>
+      <FootBar />
+    </div>
+  );
+}
+
+Object.assign(window, { VariantCard, VariantPortal, TopBar, FootBar });

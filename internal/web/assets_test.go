@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -9,20 +8,11 @@ import (
 	"testing"
 )
 
-// stubChecker is the test-side SessionChecker. We use a function field so
-// each test can override the answer in one line.
-type stubChecker struct {
-	signedIn bool
-}
-
-func (s *stubChecker) IsSignedIn(_ context.Context, _ *http.Request) bool { return s.signedIn }
-
-// newServer builds a handler with the supplied signed-in state and a
-// fixed default landing URL.
-func newServer(signedIn bool) http.Handler {
-	return NewHandler(&stubChecker{signedIn: signedIn}, Config{
-		DefaultLandingURL: "https://auth.forgeutah.tech/landing",
-	})
+// newServer builds the asset handler under test. The handler no longer
+// consults session state — signed-in/out branching happens client-side
+// via /auth/me — so the constructor takes no arguments.
+func newServer() http.Handler {
+	return NewHandler()
 }
 
 // ---------------------------------------------------------------------------
@@ -33,7 +23,7 @@ func newServer(signedIn bool) http.Handler {
 // request to / receives the React entry HTML with the correct content
 // type and the doc-review CSP header attached.
 func TestRoot_NoSession_ServesIndexHTML(t *testing.T) {
-	h := newServer(false)
+	h := newServer()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -69,7 +59,7 @@ func TestRoot_NoSession_ServesIndexHTML(t *testing.T) {
 // returns the file with the right content type and the nosniff header
 // — defence-in-depth even on non-HTML responses.
 func TestStyles_ServesCSS(t *testing.T) {
-	h := newServer(false)
+	h := newServer()
 	req := httptest.NewRequest(http.MethodGet, "/styles/auth.css", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -96,7 +86,7 @@ func TestStyles_ServesCSS(t *testing.T) {
 // response could otherwise be interpreted as an HTML document by a
 // browser and trigger XSS via fragment scripts.
 func TestJSX_ServedAsNonHTML(t *testing.T) {
-	h := newServer(false)
+	h := newServer()
 	req := httptest.NewRequest(http.MethodGet, "/auth-app.jsx", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -123,7 +113,7 @@ func TestJSX_ServedAsNonHTML(t *testing.T) {
 // embedded `assets/` subtree, but the test guards against a future
 // refactor that swaps in a wrapper which forgets to clean paths.
 func TestPathTraversal_404(t *testing.T) {
-	h := newServer(false)
+	h := newServer()
 	req := httptest.NewRequest(http.MethodGet, "/styles/../../etc/passwd", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -215,42 +205,6 @@ func TestIndexHTML_HasSRIOnBabel(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Already-signed-in integration
-// ---------------------------------------------------------------------------
-
-// TestRoot_SignedIn_RedirectsToDefaultLanding verifies the composed
-// handler honours the SessionChecker — a signed-in caller never sees
-// the React card, just a 302 to the configured landing URL. This is the
-// R13 contract the U6 HandleRoot used to enforce.
-func TestRoot_SignedIn_RedirectsToDefaultLanding(t *testing.T) {
-	h := newServer(true)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302; body=%q", rec.Code, rec.Body.String())
-	}
-	if loc := rec.Header().Get("Location"); loc != "https://auth.forgeutah.tech/landing" {
-		t.Fatalf("redirect = %q; want https://auth.forgeutah.tech/landing", loc)
-	}
-}
-
-// TestRoot_SignedIn_StaticAssetsStillServe verifies the signed-in
-// short-circuit only fires on the literal "/" path — CSS / JS / images
-// still serve so the redirect target itself can render.
-func TestRoot_SignedIn_StaticAssetsStillServe(t *testing.T) {
-	h := newServer(true)
-	req := httptest.NewRequest(http.MethodGet, "/styles/auth.css", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (signed-in static asset)", rec.Code)
-	}
-}
-
 // TestRoot_ErrorQueryParam_ServesSameIndexHTML — the ?error=... query
 // param is consumed client-side by the React app, not by the server.
 // Every error variant returns the same bytes; the React app reads the
@@ -258,7 +212,7 @@ func TestRoot_SignedIn_StaticAssetsStillServe(t *testing.T) {
 // just status to catch a future regression that adds server-side
 // branching back in.
 func TestRoot_ErrorQueryParam_ServesSameIndexHTML(t *testing.T) {
-	h := newServer(false)
+	h := newServer()
 
 	get := func(path string) []byte {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -282,16 +236,3 @@ func TestRoot_ErrorQueryParam_ServesSameIndexHTML(t *testing.T) {
 	}
 }
 
-// TestNilChecker_TreatedAsNotSignedIn verifies the NewHandler guard
-// against a nil SessionChecker — handy for tests / pre-wiring without
-// session support. A nil checker should serve the login card, not
-// crash.
-func TestNilChecker_TreatedAsNotSignedIn(t *testing.T) {
-	h := NewHandler(nil, Config{DefaultLandingURL: "https://example.com/"})
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (nil checker = render login)", rec.Code)
-	}
-}

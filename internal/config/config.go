@@ -120,7 +120,12 @@ func Load() (*Config, error) {
 		errs = append(errs, fmt.Sprintf("SESSION_IDLE_TIMEOUT (%s) cannot exceed SESSION_LIFETIME (%s)", cfg.SessionIdleTimeout, cfg.SessionLifetime))
 	}
 
-	// DefaultLandingURL is optional; if unset, /auth/ falls back to the auth host root.
+	// DefaultLandingURL is where the OAuth callback lands a signed-in
+	// caller when their pre-auth return_to is missing or fails validation.
+	// Defaults to the auth host root — the asset handler renders the
+	// portal view (signed-in status + apps list) for callers without a
+	// destination, so this default is safe (no longer a redirect loop).
+	// Operators can override to point at a specific upstream.
 	if dl := strings.TrimSpace(os.Getenv("DEFAULT_LANDING_URL")); dl != "" {
 		if _, err := url.Parse(dl); err != nil {
 			errs = append(errs, fmt.Sprintf("DEFAULT_LANDING_URL %q is not a valid URL: %v", dl, err))

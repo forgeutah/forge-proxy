@@ -28,7 +28,8 @@
       "Bash(goreleaser check *)",
       "Bash(goreleaser release *)",
       "Bash(docker buildx *)",
-      "Bash(docker rmi *)"
+      "Bash(docker rmi *)",
+      "Bash(curl -sS -w \"\\\\nHTTP %{http_code}\\\\n\" https://api.github.com/repos/forgeutah/forge-proxy/releases)"
     ],
     "additionalDirectories": [
       "/private/tmp/compound-engineering/ce-code-review/20260522-155012-64348b3b"

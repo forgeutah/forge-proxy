@@ -808,22 +808,31 @@ func TestLogout_MissingOrigin_Returns403(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Handler.IsSignedIn — the SessionChecker the web package consumes
+// GET /auth/me — session-state probe consumed by the React portal
 //
-// The GET / root route used to live here and call session.Read + Sessions.Get
-// before either redirecting to the default landing or rendering a tiny
-// HTML placeholder. U7 moved that route into internal/web (with the real
-// React card), and the Go-side already-signed-in check now lives on the
-// Handler as IsSignedIn so the web package can compose it without
-// importing internal/auth. The placeholder copy that used to live in
-// renderPlaceholder is gone — the React JSX renders the user-visible
-// strings client-side, driven by the ?error= query param.
-//
-// These three tests cover the same behaviour the four TestRoot_* tests
-// used to cover, expressed against the new interface.
+// Replaces the prior IsSignedIn-on-Handler check (and the U6 root route
+// before that). The React app at "/" fetches /auth/me on mount and
+// branches between the sign-in card (signed_in=false) and the portal
+// view (signed_in=true). Failure modes (no cookie, expired session,
+// missing user row) all collapse to {"signed_in": false} so the client
+// never has to interpret backend errors.
 // ---------------------------------------------------------------------------
 
-func TestIsSignedIn_LiveSession_ReturnsTrue(t *testing.T) {
+// decodeMe is a tiny helper so each test reads as "fire the request,
+// assert on the parsed JSON" rather than 6 lines of boilerplate per call.
+func decodeMe(t *testing.T, rec *httptest.ResponseRecorder) meResponse {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/auth/me status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	var resp meResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode /auth/me: %v; body=%q", err, rec.Body.String())
+	}
+	return resp
+}
+
+func TestMe_LiveSession_ReturnsSignedInWithUser(t *testing.T) {
 	f := newFixture(t)
 	pre, cookies := f.loginAndExtractPreAuth("https://forgeutah.tech/")
 	f.setIDToken(func() (string, int) {
@@ -835,27 +844,38 @@ func TestIsSignedIn_LiveSession_ReturnsTrue(t *testing.T) {
 		t.Fatalf("no session cookie")
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
 	req.AddCookie(sessionCookie)
-	if !f.handler.IsSignedIn(context.Background(), req) {
-		t.Fatalf("IsSignedIn = false; want true for a live session cookie")
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+
+	resp := decodeMe(t, rec)
+	if !resp.SignedIn {
+		t.Fatalf("signed_in = false; want true for a live session cookie")
+	}
+	if resp.Name == "" {
+		t.Fatalf("name empty; want the user's display name populated")
 	}
 }
 
-func TestIsSignedIn_NoCookie_ReturnsFalse(t *testing.T) {
+func TestMe_NoCookie_ReturnsSignedOut(t *testing.T) {
 	f := newFixture(t)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	if f.handler.IsSignedIn(context.Background(), req) {
-		t.Fatalf("IsSignedIn = true; want false when no cookie present")
+	req := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+
+	resp := decodeMe(t, rec)
+	if resp.SignedIn {
+		t.Fatalf("signed_in = true; want false when no cookie present")
 	}
 }
 
-func TestIsSignedIn_ExpiredSession_ReturnsFalse(t *testing.T) {
+func TestMe_ExpiredSession_ReturnsSignedOut(t *testing.T) {
 	f := newFixture(t)
-	// Manually insert a session with an expired expires_at. Expired
-	// sessions read as ErrExpired from the store; IsSignedIn must treat
-	// that the same as a missing row — the caller still sees the login
-	// card, not the default landing.
+	// Seed an expired session row directly; the store reports ErrExpired
+	// and /auth/me must collapse that to signed_in=false (same as no
+	// cookie), so the client renders the sign-in card without surfacing
+	// the internal error to the user.
 	now := time.Now().Unix()
 	ctx := context.Background()
 	res, err := f.dbobj.Writer.ExecContext(ctx, `
@@ -875,10 +895,14 @@ func TestIsSignedIn_ExpiredSession_ReturnsFalse(t *testing.T) {
 		t.Fatalf("seed expired session: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
 	req.AddCookie(&http.Cookie{Name: session.CookieName, Value: expiredID})
-	if f.handler.IsSignedIn(ctx, req) {
-		t.Fatalf("IsSignedIn = true; want false for an expired session")
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+
+	resp := decodeMe(t, rec)
+	if resp.SignedIn {
+		t.Fatalf("signed_in = true; want false for an expired session")
 	}
 }
 

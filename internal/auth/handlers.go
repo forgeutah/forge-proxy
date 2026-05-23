@@ -1,10 +1,11 @@
 package auth
 
 import (
-	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -55,22 +56,88 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/login", h.HandleLogin)
 	mux.HandleFunc("GET /auth/callback", h.HandleCallback)
 	mux.HandleFunc("POST /auth/logout", h.HandleLogout)
+	mux.HandleFunc("GET /auth/me", h.HandleMe)
 }
 
-// IsSignedIn satisfies the web.SessionChecker interface so the embedded
-// asset handler can 302 already-signed-in callers to the default landing
-// URL before serving the login card. The check is a session lookup
-// against the store; an expired or missing row reports "not signed in".
-func (h *Handler) IsSignedIn(ctx context.Context, r *http.Request) bool {
+// meResponse is the JSON shape returned by GET /auth/me. Consumed by the
+// React app on mount to decide between the sign-in card and the
+// signed-in portal. Field tags use snake_case to match the JS side.
+type meResponse struct {
+	SignedIn  bool          `json:"signed_in"`
+	Name      string        `json:"name,omitempty"`
+	Email     string        `json:"email,omitempty"`
+	AvatarURL string        `json:"avatar_url,omitempty"`
+	Apps      []meAppInfo   `json:"apps,omitempty"`
+}
+
+type meAppInfo struct {
+	Host string `json:"host"`
+	URL  string `json:"url"`
+}
+
+// HandleMe (GET /auth/me) reports the caller's session state plus the
+// list of configured upstream apps. The React app at "/" fetches this
+// once on mount and renders either the sign-in card (signed_in=false)
+// or the portal view (signed_in=true). Replaces the old server-side 302
+// from "/" to DefaultLandingURL, which produced a redirect loop when
+// the landing URL pointed back at the auth host.
+//
+// On any session/user lookup failure we report signed_in=false rather
+// than surfacing the error — the client treats the response as a clean
+// "render the card" signal and the user reaches sign-in without seeing
+// internal plumbing. Real errors are still logged for operators.
+//
+// Cache-Control: no-store because the response is per-session and
+// CORS-style intermediaries would otherwise serve a stale answer to a
+// freshly signed-in caller.
+func (h *Handler) HandleMe(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+
+	resp := meResponse{SignedIn: false}
+
 	id, ok := session.Read(r)
 	if !ok {
-		return false
+		writeJSON(w, resp)
+		return
 	}
-	sess, err := h.Sessions.Get(ctx, id)
+	sess, err := h.Sessions.Get(r.Context(), id)
 	if err != nil || sess == nil {
-		return false
+		writeJSON(w, resp)
+		return
 	}
-	return true
+	u, err := h.Users.Get(r.Context(), sess.UserID)
+	if err != nil || u == nil {
+		writeJSON(w, resp)
+		return
+	}
+
+	resp.SignedIn = true
+	resp.Name = u.Name
+	resp.Email = u.Email
+	resp.AvatarURL = u.AvatarURL
+
+	for host := range h.Cfg.UpstreamMap {
+		resp.Apps = append(resp.Apps, meAppInfo{
+			Host: host,
+			URL:  "https://" + host + "/",
+		})
+	}
+	// Sort for deterministic rendering — map iteration order would
+	// otherwise reshuffle the portal on every refresh.
+	sort.Slice(resp.Apps, func(i, j int) bool {
+		return resp.Apps[i].Host < resp.Apps[j].Host
+	})
+
+	writeJSON(w, resp)
+}
+
+// writeJSON is a tiny helper so the handler stays readable. Any encode
+// error here is a fully internal failure (the writer is in-process); we
+// can't meaningfully recover and the partial response is the best the
+// caller will see.
+func writeJSON(w http.ResponseWriter, v any) {
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // HandleLogin (GET /auth/login) is the entry point for a sign-in. It

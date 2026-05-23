@@ -1,22 +1,20 @@
-/* global React, ReactDOM, VariantCard */
+/* global React, ReactDOM, VariantCard, VariantPortal */
 /* eslint-disable no-unused-vars */
 
 // =====================================================================
 // Forge Auth Proxy — root app
 //
-// The server owns the OAuth round-trip: `connecting` / `success` /
-// `logged-in` states from the design scaffold are never user-visible in
-// production. This file therefore renders only the three terminal states
-// the server can land us on:
+// On mount we fetch /auth/me to learn whether the caller has a live
+// session. Two terminal renders:
 //
-//   ?error=auth_failed       → error card
-//   ?error=not_in_workspace  → unauthorized card
-//   (none)                   → logged-out card
+//   signed_in=false  → sign-in card (Slack button + error/unauthorized states)
+//   signed_in=true   → portal (apps list + sign-out)
 //
-// The "Continue with Slack" button is a plain link to /auth/login so the
-// flow works without JS and stays server-driven. The optional return_to
-// query param on this page is preserved into the login link so upstream
-// apps can carry the redirect target through.
+// The server owns the OAuth round-trip, so the design-scaffold
+// `connecting` / `success` mid-flow states never render in production.
+// The "Continue with Slack" button is a plain link to /auth/login so
+// the flow works without JS and stays server-driven; any return_to
+// query param on this page is preserved into the login link.
 // =====================================================================
 
 function readErrorState() {
@@ -32,22 +30,42 @@ function readReturnTo() {
   return params.get('return_to') || '';
 }
 
-// Build a /auth/login href that preserves any incoming return_to so the
-// server's strict validator can decide what to do with it. We deliberately
-// do not validate here — the server is the trust boundary.
 function loginHref(returnTo) {
   if (!returnTo) return '/auth/login';
   return '/auth/login?return_to=' + encodeURIComponent(returnTo);
 }
 
+// useMe fetches /auth/me once on mount. Returns { loaded, me } where
+// `me` is null until the fetch resolves. We treat any fetch failure as
+// "signed out" — same fail-open posture the server uses — so a flaky
+// network never blocks the sign-in card from rendering.
+function useMe() {
+  const [me, setMe] = React.useState(null);
+  const [loaded, setLoaded] = React.useState(false);
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch('/auth/me', { credentials: 'same-origin', cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : { signed_in: false }))
+      .catch(() => ({ signed_in: false }))
+      .then(data => {
+        if (!cancelled) {
+          setMe(data);
+          setLoaded(true);
+        }
+      });
+    return () => { cancelled = true; };
+  }, []);
+  return { loaded, me };
+}
+
 function AuthApp() {
-  const state = readErrorState();
+  const { loaded, me } = useMe();
+  const errorState = readErrorState();
   const returnTo = readReturnTo();
+
   // Show the destination host only when we actually have one (via
-  // return_to). Hitting the auth page directly — no return_to — gives
-  // host="" and the card renders generic copy with no destination row.
-  // No hardcoded fallback: stale strings like "deuce.forgeutah.tech"
-  // outlive the apps they name and embarrass the brand.
+  // return_to). No hardcoded fallback — stale app names outlive the
+  // apps they reference.
   let displayHost = '';
   if (returnTo) {
     try {
@@ -57,22 +75,27 @@ function AuthApp() {
     }
   }
 
-  // The card variant expects a `flow` object with `state` and a
-  // `startConnecting()` action for the Slack button + retry buttons. In
-  // production every "start" action is a navigation to /auth/login so the
-  // server can run the real OAuth round-trip — the React app never owns
-  // the connecting state itself.
   const startConnecting = React.useCallback(() => {
     window.location.assign(loginHref(returnTo));
   }, [returnTo]);
 
+  // Pre-fetch render: keep the slot empty so we don't flash the
+  // sign-in card and then swap to the portal a few ms later. The fetch
+  // is local and fast — the blank moment is barely perceptible.
+  if (!loaded) return null;
+
+  // Signed-in and no error to surface → portal.
+  if (me && me.signed_in && errorState === 'logged-out') {
+    return <VariantPortal me={me} />;
+  }
+
+  // Signed-out (or signed-in with an explicit error query) → card.
   const flow = {
-    state,
+    state: errorState,
     stepIdx: -1,
     countdown: 0,
     startConnecting,
   };
-
   return <VariantCard flow={flow} host={displayHost} withAscii={true} />;
 }
 

@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"embed"
 	"io/fs"
 	"net/http"
@@ -34,49 +33,16 @@ func AssetsFS() fs.FS {
 	return sub
 }
 
-// SessionChecker is the narrow surface the asset handler needs from the
-// session store: given a request, is the caller already signed in? We
-// pass an interface rather than the concrete *session.Store both to keep
-// internal/web free of an upstream import on internal/session and to make
-// the handler trivial to unit-test with a stub.
-type SessionChecker interface {
-	IsSignedIn(ctx context.Context, r *http.Request) bool
-}
-
-// Config carries the small set of values the handler needs from the
-// process-wide config. Kept as a value type because it's read-only and
-// the handler captures it in a closure at construction time.
-type Config struct {
-	// DefaultLandingURL is where an already-signed-in caller is redirected
-	// when they hit the asset host root. Matches the U6 already-signed-in
-	// contract — the React card is not rendered for live sessions.
-	DefaultLandingURL string
-}
-
-// NewHandler composes the already-signed-in redirect with the embedded
-// asset file server. The handler is intended to be mounted at the root
-// of the auth host. Composition order is deliberate:
-//
-//  1. The /{$} root check runs first; a live session 302s to the default
-//     landing URL (U6's R13 behaviour, ported into the web layer here).
-//  2. Every other path is forwarded to http.FileServerFS over the
-//     embedded sub-FS, wrapped with security headers.
-//
-// The session check is skipped for non-root paths because static assets
-// (CSS / JS / images) should serve regardless of whether the caller is
-// signed in — gating them would just produce a broken render on the
-// already-signed-in 302 hop itself.
-func NewHandler(checker SessionChecker, cfg Config) http.Handler {
+// NewHandler serves the embedded React asset tree from the auth host
+// root. Signed-in state is intentionally NOT handled here as a redirect:
+// the React app fetches /auth/me on mount and renders either the portal
+// (signed-in) or the sign-in card (signed-out). Doing the branch
+// client-side means a fresh hit to "/" always returns the same cacheable
+// HTML and avoids the redirect loop that bit us when DefaultLandingURL
+// pointed back at the auth host root.
+func NewHandler() http.Handler {
 	fileServer := http.FileServerFS(AssetsFS())
-	secured := withSecurityHeaders(fileServer)
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" && checker != nil && checker.IsSignedIn(r.Context(), r) {
-			http.Redirect(w, r, cfg.DefaultLandingURL, http.StatusFound)
-			return
-		}
-		secured.ServeHTTP(w, r)
-	})
+	return withSecurityHeaders(fileServer)
 }
 
 // withSecurityHeaders applies the doc-review SEC headers to every
