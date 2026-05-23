@@ -19,8 +19,6 @@
 // apps can carry the redirect target through.
 // =====================================================================
 
-const DEFAULT_HOST = 'deuce.forgeutah.tech';
-
 function readErrorState() {
   const params = new URLSearchParams(window.location.search);
   const err = params.get('error');
@@ -45,14 +43,17 @@ function loginHref(returnTo) {
 function AuthApp() {
   const state = readErrorState();
   const returnTo = readReturnTo();
-  // The card variant displays a destination host string; if we have a
-  // return_to, surface its host. Otherwise fall back to a generic name.
-  let displayHost = DEFAULT_HOST;
+  // Show the destination host only when we actually have one (via
+  // return_to). Hitting the auth page directly — no return_to — gives
+  // host="" and the card renders generic copy with no destination row.
+  // No hardcoded fallback: stale strings like "deuce.forgeutah.tech"
+  // outlive the apps they name and embarrass the brand.
+  let displayHost = '';
   if (returnTo) {
     try {
-      displayHost = new URL(returnTo).host || DEFAULT_HOST;
+      displayHost = new URL(returnTo).host || '';
     } catch (_) {
-      displayHost = DEFAULT_HOST;
+      displayHost = '';
     }
   }
 

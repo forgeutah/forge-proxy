@@ -238,7 +238,7 @@ function StateContent({ flow, app, host, withAscii, layout }) {
   if (state === 'logged-out') {
     return (
       <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-        <DestRow host={host} />
+        {host && <DestRow host={host} />}
         <SlackButton onClick={startConnecting} />
         <WhySlack />
         <JoinLink />

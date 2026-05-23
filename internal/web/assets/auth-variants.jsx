@@ -40,7 +40,11 @@ function VariantCard({ flow, host, withAscii }) {
                <>Sign in to continue<span className="cursor" /></>}
             </h1>
             <p className="lede">
-              {flow.state === 'logged-out' && <>Forge Auth is the proxy in front of our apps. Sign in with Slack — we'll forward you to <code style={{ color: 'var(--term-cyan)', background: 'transparent', fontFamily: 'var(--font-mono)' }}>{host}</code>.</>}
+              {flow.state === 'logged-out' && (
+                host
+                  ? <>Forge Auth is the proxy in front of our apps. Sign in with Slack — we'll forward you to <code style={{ color: 'var(--term-cyan)', background: 'transparent', fontFamily: 'var(--font-mono)' }}>{host}</code>.</>
+                  : <>Forge Auth is the proxy in front of our apps. Sign in with Slack to access Forge Utah tools.</>
+              )}
               {flow.state === 'error' && <>The Slack OAuth handshake didn't complete. Your session wasn't touched.</>}
               {flow.state === 'unauthorized' && <>You're signed into Slack, but not into the Forge Utah workspace. Switch to <code style={{ color: 'var(--term-cyan)', background: 'transparent', fontFamily: 'var(--font-mono)' }}>forgeutah.slack.com</code> and retry.</>}
             </p>
