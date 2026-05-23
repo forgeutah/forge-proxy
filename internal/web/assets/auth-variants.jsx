@@ -101,6 +101,7 @@ function FootBar() {
 // =====================================================================
 function VariantPortal({ me }) {
   const apps = me.apps || [];
+  const tags = me.tags || [];
   return (
     <div className="auth-stage">
       <div className="auth-dotgrid" />
@@ -127,6 +128,13 @@ function VariantPortal({ me }) {
                 ? <>You're signed in as <code style={{ color: 'var(--term-cyan)', background: 'transparent', fontFamily: 'var(--font-mono)' }}>{me.email}</code>. Pick an app below or open one in a new tab.</>
                 : <>You're signed in. Pick an app below or open one in a new tab.</>}
             </p>
+            {tags.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
+                {tags.map(tag => (
+                  <span key={tag} className="pill info">{tag}</span>
+                ))}
+              </div>
+            )}
           </div>
 
           {apps.length > 0 ? (

@@ -380,7 +380,7 @@ body {
   font-family: var(--font-sans);
   font-size: 14px;
   color: var(--fg-muted);
-  margin: -6px 0 0;
+  margin: 12px 0 0;
   line-height: 1.55;
 }
 .va-card .req-row {

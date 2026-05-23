@@ -75,11 +75,16 @@ func (h *Handler) Mount(mux *http.ServeMux, opts MountOptions) {
 // React app on mount to decide between the sign-in card and the
 // signed-in portal. Field tags use snake_case to match the JS side.
 type meResponse struct {
-	SignedIn  bool          `json:"signed_in"`
-	Name      string        `json:"name,omitempty"`
-	Email     string        `json:"email,omitempty"`
-	AvatarURL string        `json:"avatar_url,omitempty"`
-	Apps      []meAppInfo   `json:"apps,omitempty"`
+	SignedIn  bool        `json:"signed_in"`
+	Name      string      `json:"name,omitempty"`
+	Email     string      `json:"email,omitempty"`
+	AvatarURL string      `json:"avatar_url,omitempty"`
+	// Tags surfaces the user's roles (admin, founder, etc.) so the
+	// portal can render them as chips. Named "tags" in the JSON
+	// because that's how the UI labels them — operators set them via
+	// the admin CLI as "roles", but end users see them as tags.
+	Tags []string    `json:"tags,omitempty"`
+	Apps []meAppInfo `json:"apps,omitempty"`
 }
 
 type meAppInfo struct {
@@ -128,6 +133,7 @@ func (h *Handler) HandleMe(w http.ResponseWriter, r *http.Request) {
 	resp.Name = u.Name
 	resp.Email = u.Email
 	resp.AvatarURL = u.AvatarURL
+	resp.Tags = u.Roles
 
 	for host := range h.Cfg.UpstreamMap {
 		resp.Apps = append(resp.Apps, meAppInfo{
