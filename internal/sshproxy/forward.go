@@ -28,13 +28,6 @@ const dialTimeout = 10 * time.Second
 // unaffected.
 const certTTL = 2 * time.Minute
 
-// exitStatusGrace bounds how long a channel waits for the upstream's
-// trailing exit-status after both byte streams have hit EOF. A well-behaved
-// upstream sends exit-status and closes immediately, so this almost never
-// elapses; it exists so an upstream that EOFs without closing cannot wedge
-// the channel open indefinitely.
-const exitStatusGrace = 2 * time.Second
-
 // Forwarder is the channel + request proxy that implements the
 // session-forwarding bastion. It is constructed once at startup with the
 // CA key + known_hosts callback and re-invoked per authenticated
@@ -256,32 +249,48 @@ func (f *ChannelForwarder) handleChannel(ctx context.Context, newCh ssh.NewChann
 	}()
 }
 
-// proxyChannel runs the four-goroutine fan-out for one channel pair: two
-// ordered request loops + two byte-stream copies + two stderr copies.
-// CloseWrite is propagated so commands that read-to-EOF (cat, git push)
-// don't hang. Each side's Close is called only after both directions of
-// the stream copies have returned.
+// proxyChannel proxies one channel pair: two ordered request loops, two
+// byte-stream copies, and two stderr copies.
+//
+// The teardown order is the delicate part, and three plausible-looking
+// orderings are each wrong in a different, silent way:
+//
+//  1. Waiting on all six goroutines before closing DEADLOCKS. Four of them
+//     (both request loops, both stderr copies) only unblock when the
+//     channels close, and that close would sit behind the wait.
+//  2. Closing as soon as the byte-stream copies finish TRUNCATES STDERR.
+//     The stderr copy can still be flushing when stdout reaches EOF.
+//  3. Closing when the upstream's streams reach EOF closes a LIVE SESSION.
+//     Stream EOF is not channel close: the channel stays open afterwards so
+//     the upstream can send exit-status, and the client may still be
+//     sending setup requests. Closing here makes the client's next request
+//     fail with a bare EOF.
+//
+// So the signal used is the upstream's *request channel closing*, which
+// the SSH library does when the channel itself closes. That is the only
+// authoritative "this session is over". It also means exit-status has
+// already been forwarded by the time it fires, so there is nothing to race.
+//
+// Order: wait for the upstream channel to close, drain what it had already
+// written, close both sides, then drain the goroutines that were waiting
+// for that close.
 func proxyChannel(_ context.Context, clientChan ssh.Channel, clientReqs <-chan *ssh.Request, upChan ssh.Channel, upReqs <-chan *ssh.Request, logger *slog.Logger) {
-	// Two-stage wait. The byte-stream copies are the only goroutines that
-	// finish on their own: the request loops range over channels the SSH
-	// library closes on channel close, and the stderr copies block on read
-	// until the same close. Waiting on all six before closing therefore
-	// deadlocks — the close that would release four of them sits behind the
-	// wait. So: wait for the streams, close, then drain the rest.
-	var streams sync.WaitGroup // the two byte-stream copies
-	var drain sync.WaitGroup   // request loops + stderr copies
-	streams.Add(2)
+	// fromUpstream must complete before the client side closes; anything
+	// still buffered would otherwise be discarded.
+	var fromUpstream sync.WaitGroup
+	// drain unblocks only once the channels are closed.
+	var drain sync.WaitGroup
+	fromUpstream.Add(2)
 	drain.Add(4)
 
 	// Closed when the upstream's request loop has drained. The upstream
 	// sends exit-status *after* EOF, so the client side must stay open
-	// until this fires or the client's Session.Wait() sees a channel
+	// until this fires or the client's Session.Wait() reports a channel
 	// closed without exit status (golang/go#29733).
 	upReqsDone := make(chan struct{})
 
-	// Request loop: client → upstream. Ordered (single goroutine per
-	// direction) so exit-status doesn't race ahead of stdout on the wire,
-	// per golang/go#29733.
+	// Request loop: client → upstream. One goroutine per direction keeps
+	// requests ordered relative to each other on the wire.
 	go func() {
 		defer drain.Done()
 		for r := range clientReqs {
@@ -299,7 +308,8 @@ func proxyChannel(_ context.Context, clientChan ssh.Channel, clientReqs <-chan *
 		}
 	}()
 
-	// Request loop: upstream → client. Ordered.
+	// Request loop: upstream → client. Ordered, and the carrier for
+	// exit-status / exit-signal.
 	go func() {
 		defer drain.Done()
 		defer close(upReqsDone)
@@ -309,60 +319,60 @@ func proxyChannel(_ context.Context, clientChan ssh.Channel, clientReqs <-chan *
 				logger.Warn("ssh_chan_req_forward_to_client_failed",
 					"type", r.Type, "error", err.Error())
 			}
-			logger.Debug("ssh_chan_req_forwarded_up_to_client",
-				"type", r.Type, "ok", ok, "err", err)
 			if r.WantReply {
 				_ = r.Reply(ok, nil)
 			}
 		}
 	}()
 
-	// Byte stream: client → upstream. CloseWrite on the upstream side
-	// after the copy returns so the upstream sees EOF on its stdin.
+	// Upstream → client: stdout.
 	go func() {
-		defer streams.Done()
+		defer fromUpstream.Done()
+		_, _ = io.Copy(clientChan, upChan)
+	}()
+
+	// Upstream → client: stderr. Sessions carry stderr as a separate
+	// extended-data stream, so this is not covered by the copy above.
+	// Missing or truncating it breaks rsync, scp -v, and anything else
+	// whose diagnostics matter.
+	go func() {
+		defer fromUpstream.Done()
+		_, _ = io.Copy(clientChan.Stderr(), upChan.Stderr())
+	}()
+
+	// Client → upstream: stdout. CloseWrite propagates EOF so commands
+	// that read to end-of-input (cat, git push) terminate.
+	go func() {
+		defer drain.Done()
 		_, _ = io.Copy(upChan, clientChan)
 		_ = upChan.CloseWrite()
 	}()
 
-	// Byte stream: upstream → client.
-	go func() {
-		defer streams.Done()
-		_, _ = io.Copy(clientChan, upChan)
-		_ = clientChan.CloseWrite()
-	}()
-
-	// Stderr stream: upstream → client. Sessions surface stderr as a
-	// distinct extended-data stream (id=1); missing this breaks rsync,
-	// scp -v, and any command that prints diagnostic output.
-	go func() {
-		defer drain.Done()
-		_, _ = io.Copy(clientChan.Stderr(), upChan.Stderr())
-	}()
-
-	// Stderr stream: client → upstream. Required for input that arrives
-	// on the client's stderr extended-data channel (rare but possible).
+	// Client → upstream: stderr. Rare, but symmetric.
 	go func() {
 		defer drain.Done()
 		_, _ = io.Copy(upChan.Stderr(), clientChan.Stderr())
 	}()
 
-	// Stage 1: both data directions are at EOF.
-	streams.Wait()
+	// Stage 1: wait for the upstream to close the channel.
+	//
+	// Closing is the authoritative end-of-session signal, and it is not the
+	// same as the data streams reaching EOF. A channel stays open after EOF
+	// so the upstream can still send exit-status, and the client is often
+	// still sending setup requests of its own. Treating stream EOF as the
+	// end closes the pair out from under a live session -- the client's
+	// next request then fails with a bare EOF.
+	//
+	// This also removes any need to race the trailing exit-status: by the
+	// time the request channel closes, the request loop has already
+	// forwarded everything on it.
+	<-upReqsDone
 
-	// Let the upstream forward any trailing exit-status/exit-signal before
-	// the client side closes. Normally this fires immediately — the
-	// upstream closes the channel right after exit-status, which ends the
-	// request loop. The grace bound keeps a misbehaving upstream that EOFs
-	// without closing from wedging the channel forever.
-	select {
-	case <-upReqsDone:
-	case <-time.After(exitStatusGrace):
-		logger.Debug("ssh_exit_status_grace_expired")
-	}
+	// Stage 2: drain whatever the upstream had already written. The close
+	// that ended stage 1 makes both of these return promptly.
+	fromUpstream.Wait()
 
-	// Stage 2: closing is what terminates the request channels and
-	// unblocks the stderr reads, so it must happen before drain.Wait.
+	// Stage 3: closing is what releases the drain group.
 	_ = clientChan.Close()
 	_ = upChan.Close()
 	drain.Wait()

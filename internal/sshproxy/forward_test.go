@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -189,6 +190,12 @@ func startForwarderBastion(t *testing.T, upstream *testUpstream) (string, *Serve
 func startForwarderBastionOpts(t *testing.T, upstream *testUpstream, hostKeyCB ssh.HostKeyCallback) (string, *Server) {
 	t.Helper()
 
+	// Capture server- and forwarder-side events. These were previously
+	// discarded, which made every failure here blind: both sides log the
+	// reason a connection drops, and none of it reached the test output.
+	var serverLog bytes.Buffer
+	var serverLogMu sync.Mutex
+
 	hostKey := genHostSigner(t)
 	upstreamURL, _ := url.Parse("ssh://" + upstream.addr())
 	target := Upstream{Port: 0, Target: upstreamURL, AllowedRoles: []string{"ai-dev"}}
@@ -207,10 +214,9 @@ func startForwarderBastionOpts(t *testing.T, upstream *testUpstream, hostKeyCB s
 	// Build the real forwarder pointed at the upstream with permissive
 	// host-key verification (tests only). Drop debug logs to stderr so
 	// failures surface useful traces.
-	fwdLogger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	if testing.Verbose() {
-		fwdLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
+	fwdLogger := slog.New(slog.NewTextHandler(
+		&lockedWriter{w: &serverLog, mu: &serverLogMu},
+		&slog.HandlerOptions{Level: slog.LevelDebug}))
 	forwarder := NewForwarder(upstream.caKey, hostKeyCB, fwdLogger)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -220,7 +226,7 @@ func startForwarderBastionOpts(t *testing.T, upstream *testUpstream, hostKeyCB s
 	port := ln.Addr().(*net.TCPAddr).Port
 	target.Port = port
 
-	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	logger := slog.New(slog.NewTextHandler(&lockedWriter{w: &serverLog, mu: &serverLogMu}, nil))
 	cfg := Config{
 		ListenAddr: "127.0.0.1",
 		Upstreams:  map[int]Upstream{port: target},
@@ -244,6 +250,17 @@ func startForwarderBastionOpts(t *testing.T, upstream *testUpstream, hostKeyCB s
 		shutdownCtx, c := context.WithTimeout(context.Background(), 2*time.Second)
 		defer c()
 		_ = server.Shutdown(shutdownCtx)
+	})
+
+	// Registered after the shutdown cleanup above so LIFO runs this first:
+	// the dump must capture what happened during the test, not the
+	// teardown that cleanup itself causes.
+	t.Cleanup(func() {
+		if t.Failed() {
+			serverLogMu.Lock()
+			defer serverLogMu.Unlock()
+			t.Logf("server events during test:\n%s", serverLog.String())
+		}
 	})
 
 	t.Setenv("FORGE_TEST_CLIENT_FP", fp)
@@ -1100,4 +1117,75 @@ func TestForward_SignalAndExitSignalForwarded(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Error("Wait never returned after exit-signal")
 	}
+}
+
+// TestForward_LargeStderrIsNotTruncatedAtClose exercises a large stderr
+// payload written immediately before the upstream closes, end to end
+// through a real SSH client and server.
+//
+// This is coverage, not a fence: whether a premature close truncates the
+// tail depends on goroutine scheduling, so this passes under the broken
+// ordering more often than not. The deterministic guard for that invariant
+// is TestProxyChannel_WaitsForUpstreamStderrBeforeClosing, which controls
+// the timing instead of racing for it.
+func TestForward_LargeStderrIsNotTruncatedAtClose(t *testing.T) {
+	const lines = 2000
+	var want strings.Builder
+	for i := range lines {
+		fmt.Fprintf(&want, "diagnostic line %04d: the quick brown fox jumps over the lazy dog\n", i)
+	}
+	payload := want.String()
+
+	upstream := newTestUpstream(t)
+	upstream.setSessionHandler(func(_ *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request) {
+		for r := range reqs {
+			if r.WantReply {
+				_ = r.Reply(true, nil)
+			}
+			if r.Type == "exec" {
+				_, _ = io.WriteString(ch.Stderr(), payload)
+				break
+			}
+		}
+		// Exit and close with no pause: stderr is still in flight.
+		sendExitStatus(ch, 0)
+		_ = ch.Close()
+	})
+
+	addr, _ := startForwarderBastion(t, upstream)
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	var stderr strings.Builder
+	sess.Stderr = &stderr
+
+	runWithin(t, 10*time.Second, func() {
+		if err := sess.Run("noisy-command"); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+
+	if got := stderr.String(); got != payload {
+		t.Errorf("stderr truncated: got %d bytes, want %d "+
+			"(the channel pair must not close until the upstream's stderr copy has drained)",
+			len(got), len(payload))
+	}
+}
+
+// lockedWriter serialises writes from the server's goroutines into a
+// buffer the test can dump on failure.
+type lockedWriter struct {
+	w  *bytes.Buffer
+	mu *sync.Mutex
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
