@@ -504,7 +504,7 @@ func buildSSHSubsystem(
 	// Publish the CA public key at startup: the operator has to copy this
 	// into every upstream's TrustedUserCAKeys, and hunting for it on disk
 	// inside a container is needless friction.
-	slog.Info("ssh ca public key",
+	slog.Info("ssh_ca_public_key",
 		"authorized_key", strings.TrimSpace(string(ssh.MarshalAuthorizedKey(caKey.PublicKey()))),
 		"path", cfg.SSHCAKeyPath)
 
