@@ -328,11 +328,13 @@ ul { line-height: 1.6; }
 // Rendered inline rather than through internal/web, matching writeUnknownHost
 // and keeping the proxy -> web dependency direction one-way.
 func (p *Proxy) writeRoleDenied(w http.ResponseWriter, r *http.Request, u *user.User, required []string) {
+	// Logged by user_id, not email — every other log site in the proxy keys
+	// on the stable ID, and an operator maps it back with `admin list-users`
+	// rather than having addresses sitting in the log stream.
 	httplog.FromContext(r.Context()).Warn("proxy: role denied",
 		"host", r.Host,
 		"path", r.URL.RequestURI(),
 		"user_id", u.ID,
-		"email", u.Email,
 		"required_roles", strings.Join(required, ","),
 		"user_roles", strings.Join(u.Roles, ","))
 
@@ -377,7 +379,7 @@ ul { line-height: 1.6; }
 </body>
 </html>
 `,
-		html.EscapeString(proxyHost(r)),
+		html.EscapeString(NormalizeHost(r.Host)),
 		requiredList.String(),
 		html.EscapeString(u.Email),
 		html.EscapeString(held),
@@ -385,9 +387,6 @@ ul { line-height: 1.6; }
 
 	_, _ = w.Write([]byte(body))
 }
-
-// proxyHost returns the inbound Host with any port stripped, for display.
-func proxyHost(r *http.Request) string { return NormalizeHost(r.Host) }
 
 // upstreamKey and userKey are unexported context keys used to pass per-
 // request state from ServeHTTP into the Rewrite callback without closing

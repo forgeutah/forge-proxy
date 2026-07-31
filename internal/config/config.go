@@ -280,6 +280,7 @@ func parseUpstreams(raw string) (map[string]Upstream, error) {
 // non-empty-host checks below. Without this guard the proxy boots
 // "successfully" with one garbage upstream and every other app silently
 // unrouted, which is far worse than refusing to start.
+//
 // The check is on ',' alone, not also '='. ',' was the legacy entry
 // separator, so it is always present in an un-migrated multi-entry value; '='
 // only ever shows up as a side effect of the same absorption and adds no
