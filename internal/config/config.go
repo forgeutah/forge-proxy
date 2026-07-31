@@ -244,6 +244,57 @@ func parseUpstreams(raw string) (map[string]*url.URL, error) {
 
 var sshRoleNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// maxSSHPortRange caps how many ports one range entry may expand to. Every
+// port becomes a bound TCP listener with its own accept-loop goroutine, so
+// an unbounded range (say 1-65535) would exhaust file descriptors during
+// startup rather than failing with a readable error.
+const maxSSHPortRange = 256
+
+// parsePortSpec parses the left side of an SSH_UPSTREAMS entry, which is
+// either a single port ("2222") or an inclusive range ("2300-2310").
+// Returns the low and high bounds — equal for a single port — and whether
+// the range form was used, which determines how the target is interpreted.
+func parsePortSpec(entry, portRaw string) (lo, hi int, isRange bool, err error) {
+	parsePort := func(raw string) (int, error) {
+		p, convErr := strconv.Atoi(strings.TrimSpace(raw))
+		if convErr != nil {
+			return 0, fmt.Errorf("entry %q: invalid port %q: %v", entry, raw, convErr)
+		}
+		if p < 1 || p > 65535 {
+			return 0, fmt.Errorf("entry %q: port %d out of range (1-65535)", entry, p)
+		}
+		return p, nil
+	}
+
+	loRaw, hiRaw, isRange := strings.Cut(portRaw, "-")
+	if !isRange {
+		p, err := parsePort(portRaw)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		return p, p, false, nil
+	}
+
+	if lo, err = parsePort(loRaw); err != nil {
+		return 0, 0, true, err
+	}
+	if hi, err = parsePort(hiRaw); err != nil {
+		return 0, 0, true, err
+	}
+	if hi < lo {
+		return 0, 0, true, fmt.Errorf(
+			"entry %q: reversed port range %d-%d (low bound must not exceed high bound)",
+			entry, lo, hi)
+	}
+	if width := hi - lo + 1; width > maxSSHPortRange {
+		return 0, 0, true, fmt.Errorf(
+			"entry %q: port range spans %d ports, exceeding the %d-port limit "+
+				"(each port binds its own listener)",
+			entry, width, maxSSHPortRange)
+	}
+	return lo, hi, true, nil
+}
+
 // parseSSHUpstreams parses "port=host:port|role1,role2;port=host:port|role"
 // into a map keyed by listening port.
 //
@@ -268,15 +319,9 @@ func parseSSHUpstreams(raw string) (map[int]SSHUpstream, error) {
 			return nil, fmt.Errorf("entry %q has empty port", entry)
 		}
 
-		port, err := strconv.Atoi(portRaw)
+		lo, hi, isRange, err := parsePortSpec(entry, portRaw)
 		if err != nil {
-			return nil, fmt.Errorf("entry %q: invalid port %q: %v", entry, portRaw, err)
-		}
-		if port < 1 || port > 65535 {
-			return nil, fmt.Errorf("entry %q: port %d out of range (1-65535)", entry, port)
-		}
-		if _, exists := m[port]; exists {
-			return nil, fmt.Errorf("entry %q: duplicate port %d", entry, port)
+			return nil, err
 		}
 
 		targetRaw, rolesRaw, ok := strings.Cut(rest, "|")
@@ -302,7 +347,19 @@ func parseSSHUpstreams(raw string) (map[int]SSHUpstream, error) {
 		if u.Host == "" {
 			return nil, fmt.Errorf("entry %q: target missing host:port", entry)
 		}
-		if u.Port() == "" {
+		if isRange {
+			// The range form is port-preserving: inbound port N forwards to
+			// host:N. An explicit target port would read as if every port in
+			// the range funnels to that one port, which is the opposite of
+			// what the range is for, so it is rejected rather than resolved
+			// to one of the two possible meanings.
+			if u.Port() != "" {
+				return nil, fmt.Errorf(
+					"entry %q: a port range derives the upstream port from the inbound port, "+
+						"so the target must be a bare host (use %q, not %q)",
+					entry, u.Hostname(), u.Host)
+			}
+		} else if u.Port() == "" {
 			return nil, fmt.Errorf("entry %q: target missing port", entry)
 		}
 
@@ -321,7 +378,26 @@ func parseSSHUpstreams(raw string) (map[int]SSHUpstream, error) {
 			return nil, fmt.Errorf("entry %q: empty role list", entry)
 		}
 
-		m[port] = SSHUpstream{Port: port, Target: u, AllowedRoles: roles}
+		// Expand the range here so nothing downstream needs to know ranges
+		// exist: the server binds one listener per map entry either way.
+		for port := lo; port <= hi; port++ {
+			if _, exists := m[port]; exists {
+				return nil, fmt.Errorf("entry %q: duplicate port %d", entry, port)
+			}
+
+			target := u
+			if isRange {
+				// Each entry gets its own *url.URL. Sharing one pointer
+				// across the range would let a later mutation through any
+				// single entry retarget every port in it.
+				perPort, err := url.Parse(fmt.Sprintf("ssh://%s:%d", u.Hostname(), port))
+				if err != nil {
+					return nil, fmt.Errorf("entry %q: build target for port %d: %v", entry, port, err)
+				}
+				target = perPort
+			}
+			m[port] = SSHUpstream{Port: port, Target: target, AllowedRoles: roles}
+		}
 	}
 	if len(m) == 0 {
 		return nil, errors.New("no valid entries")
