@@ -139,8 +139,10 @@ func TestLoad_UpstreamsParsing(t *testing.T) {
 		{"role with space", "deuce.forgeutah.tech=http://deuce:8080|ai dev", "invalid role name"},
 		{"role with pipe", "deuce.forgeutah.tech=http://deuce:8080|ai|dev", "invalid role name"},
 
-		// The migration guard. Each of these parses "successfully" as a URL
-		// if allowed through — that is precisely why the guard exists.
+		// Covers AE5. The migration guard. Each of these parses
+		// "successfully" as a URL if allowed through — that is precisely why
+		// the guard exists, and why a parse-success check alone would let a
+		// mangled upstream map boot.
 		{"legacy comma form", "deuce.forgeutah.tech=http://deuce:8080,platform.forgeutah.tech=http://platform:8080", "old comma-separated format"},
 		{"legacy comma form single trailing", "deuce.forgeutah.tech=http://deuce:8080,", "old comma-separated format"},
 	}
@@ -178,6 +180,8 @@ func TestLoad_UpstreamsParsed(t *testing.T) {
 		t.Error("deuce entry should report gated")
 	}
 
+	// Covers AE1. An entry with no '|' parses ungated — the backward-compatible
+	// default that keeps every pre-gating entry working.
 	ungated, ok := cfg.UpstreamMap["platform.forgeutah.tech"]
 	if !ok {
 		t.Fatal("missing platform.forgeutah.tech entry")
