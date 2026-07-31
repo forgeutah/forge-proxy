@@ -181,8 +181,11 @@ func newProxyFixture(t *testing.T) *proxyFixture {
 		BaseDomain:   "forgeutah.tech",
 		CookieDomain: ".forgeutah.tech",
 		ProxySecret:  "test-proxy-secret-32chars-min-padding",
-		UpstreamMap: map[string]*url.URL{
-			"deuce.forgeutah.tech": upstreamURL,
+		// Ungated by default — the pre-gating shape, so every existing test
+		// exercises the unrestricted path. Tests that care about the gate
+		// call requireRoles.
+		UpstreamMap: map[string]config.Upstream{
+			"deuce.forgeutah.tech": {Target: upstreamURL},
 		},
 	}
 
@@ -216,6 +219,26 @@ func newProxyFixture(t *testing.T) *proxyFixture {
 		sessionID: sess.ID,
 		proxy:     New(cfg, sessions, users),
 	}
+}
+
+// requireRoles gates the fixture's upstream behind the given roles and
+// rebuilds the proxy so the new host map takes effect. NewHostMap copies the
+// config map at construction time, so mutating cfg alone would not reach the
+// running proxy.
+func (f *proxyFixture) requireRoles(roles ...string) {
+	entry := f.cfg.UpstreamMap["deuce.forgeutah.tech"]
+	entry.RequiredRoles = roles
+	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = entry
+	f.proxy = New(f.cfg, f.sessions, f.users)
+}
+
+// setUpstreamTarget repoints the fixture's upstream and rebuilds the proxy,
+// preserving whatever role gating is configured.
+func (f *proxyFixture) setUpstreamTarget(target *url.URL) {
+	entry := f.cfg.UpstreamMap["deuce.forgeutah.tech"]
+	entry.Target = target
+	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = entry
+	f.proxy = New(f.cfg, f.sessions, f.users)
 }
 
 // signedInRequest builds a request carrying the fixture's session cookie.
@@ -365,8 +388,7 @@ func TestProxy_UpstreamReturns500_PassedThrough(t *testing.T) {
 	upstreamURL, _ := url.Parse(upstream.URL)
 
 	f := newProxyFixture(t)
-	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = upstreamURL
-	f.proxy = New(f.cfg, f.sessions, f.users)
+	f.setUpstreamTarget(upstreamURL)
 
 	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
 	w := httptest.NewRecorder()
@@ -390,8 +412,7 @@ func TestProxy_UpstreamUnreachable_502(t *testing.T) {
 	deadURL, _ := url.Parse(deadSrv.URL)
 	deadSrv.Close() // shut it down so dials fail.
 
-	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = deadURL
-	f.proxy = New(f.cfg, f.sessions, f.users)
+	f.setUpstreamTarget(deadURL)
 
 	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
 	w := httptest.NewRecorder()

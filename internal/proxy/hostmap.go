@@ -1,13 +1,20 @@
 package proxy
 
 import (
-	"net/url"
 	"strings"
+
+	"github.com/forgeutah/forge-proxy/internal/config"
 )
 
-// HostMap resolves an inbound HTTP Host header to the configured upstream
-// origin. The map is built once at startup from the UPSTREAMS env var and is
-// read-only thereafter, so no synchronisation is needed.
+// HostMap resolves an inbound HTTP Host header to the configured upstream —
+// both where to forward and which roles gate the forward. The map is built
+// once at startup from the UPSTREAMS env var and is read-only thereafter, so
+// no synchronisation is needed.
+//
+// Route and role requirement live in one entry rather than two parallel maps
+// keyed on host: a second map could drift out of step with this one, and a
+// host present in the route map but missing from the role map would silently
+// serve ungated.
 //
 // Host header normalisation: per RFC 7230 §5.4, Host comparisons are
 // case-insensitive. Browsers occasionally send a capitalised Host (e.g.
@@ -17,13 +24,13 @@ import (
 // upstream. Any port suffix on the inbound Host is stripped before lookup —
 // the proxy listens on a single port and the upstream-map keys are bare
 // hostnames.
-type HostMap map[string]*url.URL
+type HostMap map[string]config.Upstream
 
 // NewHostMap copies the supplied map (normalising keys to lowercase) so the
 // caller can hand us the config-loaded map without worrying about us mutating
 // it. nil input yields an empty (non-nil) HostMap so callers can always range
 // or look up without a nil check.
-func NewHostMap(upstreams map[string]*url.URL) HostMap {
+func NewHostMap(upstreams map[string]config.Upstream) HostMap {
 	m := make(HostMap, len(upstreams))
 	for host, u := range upstreams {
 		m[strings.ToLower(host)] = u
@@ -31,17 +38,17 @@ func NewHostMap(upstreams map[string]*url.URL) HostMap {
 	return m
 }
 
-// Resolve returns the upstream URL for the given inbound Host header value,
-// or (nil, false) if no entry matches. The host is compared case-insensitively
-// and any ":port" suffix is stripped before lookup (Host values commonly
-// include a port; the upstream-map keys do not).
+// Resolve returns the upstream entry for the given inbound Host header value,
+// or (zero, false) if no entry matches. The host is compared
+// case-insensitively and any ":port" suffix is stripped before lookup (Host
+// values commonly include a port; the upstream-map keys do not).
 //
-// Returning (nil, false) for unknown hosts (rather than a sentinel error) is
+// Returning false for unknown hosts (rather than a sentinel error) is
 // deliberate: the HTTP-layer caller renders a 404 with a branded "unknown
 // Forge app" page, which is a different response shape than the 502 we'd
 // emit for an upstream that exists but fails. Distinguishing the two at the
 // boundary keeps the error-handling explicit.
-func (m HostMap) Resolve(host string) (*url.URL, bool) {
+func (m HostMap) Resolve(host string) (config.Upstream, bool) {
 	u, ok := m[NormalizeHost(host)]
 	return u, ok
 }

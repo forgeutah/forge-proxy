@@ -135,7 +135,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// host) had a nasty local-dev failure mode: hitting `localhost:8083`
 	// without a session would 302 to the configured AUTH_HOST (often the
 	// production auth host), sucking the user into the wrong environment.
-	upstream, ok := p.hosts.Resolve(r.Host)
+	entry, ok := p.hosts.Resolve(r.Host)
 	if !ok {
 		p.writeUnknownHost(w, r)
 		return
@@ -198,7 +198,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// context for this means we keep the ReverseProxy a singleton (the
 	// supported pattern) rather than building a fresh one per request.
 	ctx := r.Context()
-	ctx = context.WithValue(ctx, upstreamKey{}, upstream)
+	ctx = context.WithValue(ctx, upstreamKey{}, entry.Target)
 	ctx = context.WithValue(ctx, userKey{}, u)
 
 	p.reverseProxy.ServeHTTP(w, r.WithContext(ctx))

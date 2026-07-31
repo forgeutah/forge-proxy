@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,9 @@ func validEnv(t *testing.T) map[string]string {
 		"SLACK_TEAM_ID":       "T0R7GR",
 		"DB_PATH":             filepath.Join(tmp, "forge.db"),
 		"PROXY_SECRET":        "this-is-a-test-secret-with-32+-chars",
-		"UPSTREAMS":           "deuce.forgeutah.tech=http://deuce:8080,platform.forgeutah.tech=http://platform:8080",
+		// One gated entry and one ungated, so the common fixture exercises
+		// both shapes of the grammar.
+		"UPSTREAMS": "deuce.forgeutah.tech=http://deuce:8080|ai-dev,admin;platform.forgeutah.tech=http://platform:8080",
 	}
 }
 
@@ -128,7 +131,18 @@ func TestLoad_UpstreamsParsing(t *testing.T) {
 		{"missing equals", "deuce.forgeutah.tech-http://deuce:8080", "missing '='"},
 		{"bad scheme", "deuce.forgeutah.tech=ftp://deuce:8080", "scheme must be http or https"},
 		{"bad url", "deuce.forgeutah.tech=not-a-url", "scheme must be http or https"},
-		{"duplicate host", "deuce.forgeutah.tech=http://a:1,deuce.forgeutah.tech=http://b:2", "duplicate inbound host"},
+		{"duplicate host", "deuce.forgeutah.tech=http://a:1;deuce.forgeutah.tech=http://b:2", "duplicate inbound host"},
+		{"empty host", "=http://deuce:8080", "empty host or url"},
+		{"empty url", "deuce.forgeutah.tech=", "empty host or url"},
+		{"empty role list", "deuce.forgeutah.tech=http://deuce:8080|", "empty role list"},
+		{"blank role name", "deuce.forgeutah.tech=http://deuce:8080|ai-dev,,admin", "empty role name"},
+		{"role with space", "deuce.forgeutah.tech=http://deuce:8080|ai dev", "invalid role name"},
+		{"role with pipe", "deuce.forgeutah.tech=http://deuce:8080|ai|dev", "invalid role name"},
+
+		// The migration guard. Each of these parses "successfully" as a URL
+		// if allowed through — that is precisely why the guard exists.
+		{"legacy comma form", "deuce.forgeutah.tech=http://deuce:8080,platform.forgeutah.tech=http://platform:8080", "old comma-separated format"},
+		{"legacy comma form single trailing", "deuce.forgeutah.tech=http://deuce:8080,", "old comma-separated format"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -150,12 +164,63 @@ func TestLoad_UpstreamsParsed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	u, ok := cfg.UpstreamMap["deuce.forgeutah.tech"]
+	gated, ok := cfg.UpstreamMap["deuce.forgeutah.tech"]
 	if !ok {
 		t.Fatal("missing deuce.forgeutah.tech entry")
 	}
-	if u.String() != "http://deuce:8080" {
-		t.Errorf("deuce url = %q", u.String())
+	if gated.Target.String() != "http://deuce:8080" {
+		t.Errorf("deuce url = %q", gated.Target.String())
+	}
+	if got, want := gated.RequiredRoles, []string{"ai-dev", "admin"}; !slices.Equal(got, want) {
+		t.Errorf("deuce roles = %v, want %v (declaration order preserved)", got, want)
+	}
+	if !gated.Gated() {
+		t.Error("deuce entry should report gated")
+	}
+
+	ungated, ok := cfg.UpstreamMap["platform.forgeutah.tech"]
+	if !ok {
+		t.Fatal("missing platform.forgeutah.tech entry")
+	}
+	if ungated.Target.String() != "http://platform:8080" {
+		t.Errorf("platform url = %q", ungated.Target.String())
+	}
+	if len(ungated.RequiredRoles) != 0 {
+		t.Errorf("platform roles = %v, want none (no '|' means ungated)", ungated.RequiredRoles)
+	}
+	if ungated.Gated() {
+		t.Error("platform entry should report ungated")
+	}
+}
+
+func TestUpstream_Permits(t *testing.T) {
+	cases := []struct {
+		name      string
+		required  []string
+		userRoles []string
+		want      bool
+	}{
+		{"ungated permits roleless user", nil, nil, true},
+		{"ungated permits any user", nil, []string{"admin"}, true},
+		{"gated permits exact match", []string{"ai-dev"}, []string{"ai-dev"}, true},
+		{"gated permits any one of several", []string{"ai-dev", "admin"}, []string{"admin"}, true},
+		{"gated permits when user has extras", []string{"ai-dev"}, []string{"organizer", "ai-dev"}, true},
+		{"gated denies roleless user", []string{"ai-dev"}, nil, false},
+		{"gated denies non-matching role", []string{"ai-dev"}, []string{"admin"}, false},
+		// admin is an ordinary role name, not a bypass.
+		{"admin is not a bypass", []string{"ai-dev"}, []string{"admin"}, false},
+		// Exact comparison, not prefix or substring.
+		{"denies role with matching prefix", []string{"ai-dev"}, []string{"ai-dev-admin"}, false},
+		{"denies role that contains requirement", []string{"dev"}, []string{"ai-dev"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := Upstream{RequiredRoles: tc.required}
+			if got := u.Permits(tc.userRoles); got != tc.want {
+				t.Errorf("Permits(%v) with required %v = %v, want %v",
+					tc.userRoles, tc.required, got, tc.want)
+			}
+		})
 	}
 }
 
