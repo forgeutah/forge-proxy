@@ -44,15 +44,22 @@ type UserStore interface {
 //     (logged distinctly for capacity-planning visibility).
 //  3. Look up the user row referenced by the session. Missing → clear
 //     cookie + 302 to login (forced-logout race window).
-//  4. Touch the session (60s-throttled in the store). Touch failure is
+//  4. Role gate: if the resolved upstream declares required roles, the
+//     user must hold at least one → otherwise 403 with a branded page
+//     naming what's needed. Runs before any upstream connection opens, so
+//     a denied request never reaches the app. An upstream with no declared
+//     roles skips this entirely.
+//  5. Touch the session (60s-throttled in the store). Touch failure is
 //     logged and the request continues — the session remains valid for
 //     the rest of its current window per R11/U4 semantics.
-//  5. Resolve the inbound Host to an upstream URL. Unknown → 404 with a
-//     branded "unknown Forge app" page (NOT a 502 — 502 implies the
-//     upstream exists but failed, which is the wrong shape for "no such
-//     app").
 //  6. Forward through httputil.ReverseProxy.Rewrite, strip + inject the
 //     X-Forge-* contract headers, and stream the response.
+//
+// Host resolution happens before all of the above: an inbound Host with no
+// configured upstream gets a branded 404 immediately (NOT a 502 — 502
+// implies the upstream exists but failed, which is the wrong shape for "no
+// such app"), rather than bouncing the user through auth to land on the
+// same page.
 type Proxy struct {
 	cfg          *config.Config
 	hosts        HostMap
@@ -186,7 +193,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 4: Touch the session (60s-throttled). Failure is non-fatal —
+	// Step 4: role gate. This runs after the user row is loaded and before
+	// any upstream connection is opened, so a denied request never reaches
+	// the app at all. An entry with no required roles skips the check
+	// entirely — that is the pre-gating behaviour and the default.
+	//
+	// No role name is privileged here; "admin" grants nothing unless the
+	// entry lists it. Apps still receive X-Forge-Roles and remain
+	// responsible for their own authorization — this gate is an additional
+	// layer, not a replacement for it.
+	if !entry.Permits(u.Roles) {
+		p.writeRoleDenied(w, r, u, entry.RequiredRoles)
+		return
+	}
+
+	// Step 5: Touch the session (60s-throttled). Failure is non-fatal —
 	// log and continue per U4's documented contract.
 	if err := p.sessions.Touch(r.Context(), sessionID); err != nil {
 		logger.Warn("proxy: session touch failed; continuing",
@@ -291,6 +312,82 @@ ul { line-height: 1.6; }
 
 	_, _ = w.Write([]byte(body))
 }
+
+// writeRoleDenied renders the 403 page shown to a signed-in user who holds
+// none of the roles the requested app requires.
+//
+// 403 rather than 404: the app exists and the caller is authenticated — they
+// are simply not permitted. That is a different shape from writeUnknownHost's
+// "no such app", and an operator reading logs needs to tell the two apart.
+//
+// The page names the required roles on purpose. Its job is to tell the user
+// exactly what to ask for, and it is the surface a future "Request access"
+// action attaches to. It is only ever rendered to an authenticated member of
+// the workspace, never to an anonymous caller.
+//
+// Rendered inline rather than through internal/web, matching writeUnknownHost
+// and keeping the proxy -> web dependency direction one-way.
+func (p *Proxy) writeRoleDenied(w http.ResponseWriter, r *http.Request, u *user.User, required []string) {
+	httplog.FromContext(r.Context()).Warn("proxy: role denied",
+		"host", r.Host,
+		"path", r.URL.RequestURI(),
+		"user_id", u.ID,
+		"email", u.Email,
+		"required_roles", strings.Join(required, ","),
+		"user_roles", strings.Join(u.Roles, ","))
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// The page reflects role state that changes the instant an operator
+	// grants access. A cached 403 would keep showing the denial after the
+	// grant, which reads as the grant not working.
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+
+	var requiredList strings.Builder
+	for _, role := range required {
+		requiredList.WriteString("<li><code>")
+		requiredList.WriteString(html.EscapeString(role))
+		requiredList.WriteString("</code></li>")
+	}
+
+	held := "none"
+	if len(u.Roles) > 0 {
+		held = strings.Join(u.Roles, ", ")
+	}
+
+	body := fmt.Sprintf(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Access required</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem; color: #1a1a1a; }
+code { background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }
+ul { line-height: 1.6; }
+.meta { color: #555; font-size: 0.9rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<h1>You don't have access to this app</h1>
+<p><code>%s</code> requires one of these roles:</p>
+<ul>%s</ul>
+<p>Ask a Forge organizer to grant you access.</p>
+<p class="meta">Signed in as %s &middot; your roles: %s</p>
+</body>
+</html>
+`,
+		html.EscapeString(proxyHost(r)),
+		requiredList.String(),
+		html.EscapeString(u.Email),
+		html.EscapeString(held),
+	)
+
+	_, _ = w.Write([]byte(body))
+}
+
+// proxyHost returns the inbound Host with any port stripped, for display.
+func proxyHost(r *http.Request) string { return NormalizeHost(r.Host) }
 
 // upstreamKey and userKey are unexported context keys used to pass per-
 // request state from ServeHTTP into the Rewrite callback without closing
