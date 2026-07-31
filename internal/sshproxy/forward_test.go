@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -10,12 +11,14 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/forgeutah/forge-proxy/internal/sshkey"
@@ -131,6 +134,19 @@ func (u *testUpstream) setSessionHandler(h func(t *testing.T, ch ssh.Channel, re
 	u.mu.Unlock()
 }
 
+func (u *testUpstream) setDirectHandler(h func(t *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request, extra []byte)) {
+	u.mu.Lock()
+	u.directHandler = h
+	u.mu.Unlock()
+}
+
+// observed returns a snapshot of the channel types the upstream has seen.
+func (u *testUpstream) observed() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.observedReqs...)
+}
+
 // defaultSessionHandler reads exec/shell requests and exits with success.
 func defaultSessionHandler(_ *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request) {
 	for r := range reqs {
@@ -164,6 +180,14 @@ func sendExitStatus(ch ssh.Channel, code uint32) {
 // to the supplied upstream. Returns the listener address clients dial.
 func startForwarderBastion(t *testing.T, upstream *testUpstream) (string, *Server) {
 	t.Helper()
+	return startForwarderBastionOpts(t, upstream, ssh.InsecureIgnoreHostKey())
+}
+
+// startForwarderBastionOpts is startForwarderBastion with control over the
+// outbound host-key callback, so a test can prove the proxy refuses an
+// upstream whose key it does not trust.
+func startForwarderBastionOpts(t *testing.T, upstream *testUpstream, hostKeyCB ssh.HostKeyCallback) (string, *Server) {
+	t.Helper()
 
 	hostKey := genHostSigner(t)
 	upstreamURL, _ := url.Parse("ssh://" + upstream.addr())
@@ -187,7 +211,7 @@ func startForwarderBastion(t *testing.T, upstream *testUpstream) (string, *Serve
 	if testing.Verbose() {
 		fwdLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
-	forwarder := NewForwarder(upstream.caKey, ssh.InsecureIgnoreHostKey(), fwdLogger)
+	forwarder := NewForwarder(upstream.caKey, hostKeyCB, fwdLogger)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -648,4 +672,432 @@ func TestForward_RepeatedSessionsDoNotLeakGoroutines(t *testing.T) {
 	}
 	t.Errorf("goroutines after %d sessions = %d, baseline %d (slack %d) — "+
 		"per-channel goroutines are not being released", rounds, final, base, slack)
+}
+
+// --- U2 channel-type and request coverage --------------------------------
+
+// exitSignalMsg is the RFC 4254 exit-signal payload.
+type exitSignalMsg struct {
+	Signal     string
+	CoreDumped bool
+	Msg        string
+	Lang       string
+}
+
+// ptyWindow is the window-change payload (and the tail of pty-req).
+type ptyWindow struct {
+	Columns uint32
+	Rows    uint32
+	WidthPx uint32
+	HeighPx uint32
+}
+
+// TestForward_SFTPSubsystemRoundTrips is the highest-value gap: SFTP is how
+// VSCode Remote SSH moves files, and it exercises subsystem requests plus
+// sustained bidirectional streaming rather than a one-shot exec. pkg/sftp
+// is a test-only dependency -- the bastion itself must never import it.
+func TestForward_SFTPSubsystemRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("from upstream\n"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	upstream := newTestUpstream(t)
+	upstream.setSessionHandler(func(_ *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request) {
+		for r := range reqs {
+			if r.Type == "subsystem" && len(r.Payload) > 4 && string(r.Payload[4:]) == "sftp" {
+				if r.WantReply {
+					_ = r.Reply(true, nil)
+				}
+				srv, err := sftp.NewServer(ch)
+				if err != nil {
+					_ = ch.Close()
+					return
+				}
+				_ = srv.Serve()
+				_ = ch.Close()
+				return
+			}
+			if r.WantReply {
+				_ = r.Reply(false, nil)
+			}
+		}
+	})
+
+	addr, _ := startForwarderBastion(t, upstream)
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	runWithin(t, 10*time.Second, func() {
+		sc, err := sftp.NewClient(client)
+		if err != nil {
+			t.Errorf("sftp.NewClient through bastion: %v", err)
+			return
+		}
+		defer sc.Close()
+
+		entries, err := sc.ReadDir(dir)
+		if err != nil {
+			t.Errorf("ReadDir: %v", err)
+			return
+		}
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		if len(names) != 1 || names[0] != "existing.txt" {
+			t.Errorf("ReadDir = %v, want [existing.txt]", names)
+		}
+
+		// Read the seeded file back through the proxy.
+		rf, err := sc.Open(filepath.Join(dir, "existing.txt"))
+		if err != nil {
+			t.Errorf("Open: %v", err)
+			return
+		}
+		got, err := io.ReadAll(rf)
+		_ = rf.Close()
+		if err != nil {
+			t.Errorf("ReadAll: %v", err)
+			return
+		}
+		if strings.TrimSpace(string(got)) != "from upstream" {
+			t.Errorf("file contents = %q, want %q", got, "from upstream")
+		}
+
+		// And write a new one -- proves the client->upstream direction.
+		wf, err := sc.Create(filepath.Join(dir, "uploaded.txt"))
+		if err != nil {
+			t.Errorf("Create: %v", err)
+			return
+		}
+		if _, err := wf.Write([]byte("from client\n")); err != nil {
+			t.Errorf("Write: %v", err)
+		}
+		_ = wf.Close()
+	})
+
+	// Verify the upload landed on the upstream's real filesystem.
+	got, err := os.ReadFile(filepath.Join(dir, "uploaded.txt"))
+	if err != nil {
+		t.Fatalf("uploaded file missing: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "from client" {
+		t.Errorf("uploaded contents = %q, want %q", got, "from client")
+	}
+}
+
+// TestForward_ShutdownClosesLiveSession proves the teardown path the session
+// registry (U3) and the binary's shutdown ordering (U5) both depend on: a
+// session held open is torn down promptly when the server shuts down, rather
+// than surviving until the client happens to disconnect.
+func TestForward_ShutdownClosesLiveSession(t *testing.T) {
+	upstream := newTestUpstream(t)
+	// Hold the session open until the channel is torn down under us.
+	upstream.setSessionHandler(func(_ *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request) {
+		for r := range reqs {
+			if r.WantReply {
+				_ = r.Reply(true, nil)
+			}
+		}
+		_ = ch.Close()
+	})
+
+	addr, server := startForwarderBastion(t, upstream)
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.Shell(); err != nil {
+		t.Fatalf("Shell: %v", err)
+	}
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- sess.Wait() }()
+
+	// The session is live; nothing should have returned yet.
+	select {
+	case err := <-waitErr:
+		t.Fatalf("session ended before shutdown: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case <-waitErr: // any error is fine -- the transport went away
+	case <-time.After(3 * time.Second):
+		t.Error("session still live 3s after Shutdown returned")
+	}
+}
+
+// TestForward_WindowChangeForwarded covers the mid-session request path that
+// keeps an interactive VSCode/tmux terminal correctly sized.
+func TestForward_WindowChangeForwarded(t *testing.T) {
+	type observation struct {
+		typ string
+		win ptyWindow
+	}
+	seen := make(chan observation, 8)
+
+	upstream := newTestUpstream(t)
+	upstream.setSessionHandler(func(_ *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request) {
+		for r := range reqs {
+			if r.Type == "window-change" {
+				var w ptyWindow
+				if err := ssh.Unmarshal(r.Payload, &w); err == nil {
+					select {
+					case seen <- observation{typ: r.Type, win: w}:
+					default:
+					}
+				}
+			}
+			if r.WantReply {
+				_ = r.Reply(true, nil)
+			}
+		}
+		_ = ch.Close()
+	})
+
+	addr, _ := startForwarderBastion(t, upstream)
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.RequestPty("xterm", 24, 80, ssh.TerminalModes{}); err != nil {
+		t.Fatalf("RequestPty: %v", err)
+	}
+	if err := sess.WindowChange(40, 100); err != nil {
+		t.Fatalf("WindowChange: %v", err)
+	}
+
+	select {
+	case got := <-seen:
+		if got.win.Rows != 40 || got.win.Columns != 100 {
+			t.Errorf("upstream saw %dx%d (rows x cols), want 40x100", got.win.Rows, got.win.Columns)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("upstream never observed window-change")
+	}
+}
+
+// TestForward_DirectTCPIPChannelForwarded covers `ssh -L` local forwarding:
+// the direct-tcpip channel must reach the upstream with its open payload
+// byte-identical, since that payload carries the target host and port.
+func TestForward_DirectTCPIPChannelForwarded(t *testing.T) {
+	gotExtra := make(chan []byte, 1)
+
+	upstream := newTestUpstream(t)
+	upstream.setDirectHandler(func(_ *testing.T, ch ssh.Channel, _ <-chan *ssh.Request, extra []byte) {
+		select {
+		case gotExtra <- extra:
+		default:
+		}
+		_, _ = ch.Write([]byte("forwarded\n"))
+		_ = ch.Close()
+	})
+
+	addr, _ := startForwarderBastion(t, upstream)
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	// Build the direct-tcpip payload the way x/crypto does for -L.
+	payload := ssh.Marshal(&struct {
+		DestAddr string
+		DestPort uint32
+		OrigAddr string
+		OrigPort uint32
+	}{"example.internal", 80, "127.0.0.1", 12345})
+
+	ch, reqs, err := client.OpenChannel("direct-tcpip", payload)
+	if err != nil {
+		t.Fatalf("OpenChannel(direct-tcpip): %v", err)
+	}
+	go ssh.DiscardRequests(reqs)
+	defer ch.Close()
+
+	select {
+	case extra := <-gotExtra:
+		if !bytes.Equal(extra, payload) {
+			t.Errorf("upstream ExtraData = %x, want %x", extra, payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream never received the direct-tcpip channel")
+	}
+
+	out, err := io.ReadAll(ch)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "forwarded" {
+		t.Errorf("channel payload = %q, want %q", out, "forwarded")
+	}
+}
+
+// TestForward_UpstreamHostKeyMismatchRefused proves the proxy will not
+// forward to an upstream whose host key it cannot verify. Without this the
+// outbound leg would be trust-on-first-use against the tailnet.
+func TestForward_UpstreamHostKeyMismatchRefused(t *testing.T) {
+	upstream := newTestUpstream(t)
+
+	reject := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		return errors.New("host key mismatch (test)")
+	}
+	addr, _ := startForwarderBastionOpts(t, upstream, reject)
+
+	// The bastion accepts the client, then fails on the outbound leg and
+	// drops the connection. Either the session or the dial fails; both are
+	// correct, and neither may hang.
+	runWithin(t, 8*time.Second, func() {
+		client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+			User:            "alice",
+			Auth:            []ssh.AuthMethod{ssh.PublicKeys(dialBastionSigner(t))},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			Timeout:         3 * time.Second,
+		})
+		if err != nil {
+			return // refused at connect -- acceptable
+		}
+		defer client.Close()
+
+		sess, err := client.NewSession()
+		if err != nil {
+			return // refused when the channel is opened -- acceptable
+		}
+		defer sess.Close()
+		if _, err := sess.Output("echo hello"); err == nil {
+			t.Error("session succeeded despite upstream host-key rejection")
+		}
+	})
+
+	if got := upstream.observed(); len(got) != 0 {
+		t.Errorf("upstream saw %v, want no channels -- the proxy should never have connected", got)
+	}
+}
+
+// TestForward_GlobalTCPIPForwardDeclined covers reverse port forwarding,
+// which v1 refuses. The refusal must be an explicit "no" that leaves the
+// connection usable, not a dropped request or a broken session.
+func TestForward_GlobalTCPIPForwardDeclined(t *testing.T) {
+	upstream := newTestUpstream(t)
+	addr, _ := startForwarderBastion(t, upstream)
+
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	payload := ssh.Marshal(&struct {
+		Addr string
+		Port uint32
+	}{"0.0.0.0", 8080})
+
+	ok, _, err := client.SendRequest("tcpip-forward", true, payload)
+	if err != nil {
+		t.Fatalf("SendRequest(tcpip-forward): %v", err)
+	}
+	if ok {
+		t.Error("tcpip-forward was accepted; v1 must decline reverse forwarding")
+	}
+
+	// The connection must still work after the refusal.
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession after declined forward: %v", err)
+	}
+	defer sess.Close()
+	out, err := sess.Output("echo hello")
+	if err != nil {
+		t.Fatalf("Output after declined forward: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "hello" {
+		t.Errorf("stdout = %q, want %q", out, "hello")
+	}
+}
+
+// TestForward_SignalAndExitSignalForwarded covers Ctrl-C: the client's
+// signal request must reach the upstream, and the upstream's exit-signal
+// must come back so the client learns how the command died.
+func TestForward_SignalAndExitSignalForwarded(t *testing.T) {
+	sawSignal := make(chan string, 1)
+
+	upstream := newTestUpstream(t)
+	upstream.setSessionHandler(func(_ *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request) {
+		for r := range reqs {
+			if r.WantReply {
+				_ = r.Reply(true, nil)
+			}
+			if r.Type == "signal" {
+				var sig struct{ Name string }
+				if err := ssh.Unmarshal(r.Payload, &sig); err == nil {
+					select {
+					case sawSignal <- sig.Name:
+					default:
+					}
+				}
+				_, _ = ch.SendRequest("exit-signal", false, ssh.Marshal(&exitSignalMsg{
+					Signal: "INT",
+					Msg:    "interrupted",
+				}))
+				_ = ch.Close()
+				return
+			}
+		}
+		_ = ch.Close()
+	})
+
+	addr, _ := startForwarderBastion(t, upstream)
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.Start("sleep 30"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := sess.Signal(ssh.SIGINT); err != nil {
+		t.Fatalf("Signal: %v", err)
+	}
+
+	select {
+	case name := <-sawSignal:
+		if name != "INT" {
+			t.Errorf("upstream saw signal %q, want INT", name)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream never observed the signal request")
+	}
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- sess.Wait() }()
+	select {
+	case err := <-waitErr:
+		if err == nil {
+			t.Error("Wait returned nil; want a signal-carrying error")
+			return
+		}
+		var exitErr *ssh.ExitError
+		if errors.As(err, &exitErr) {
+			if got := exitErr.Waitmsg.Signal(); got != "INT" {
+				t.Errorf("Waitmsg.Signal() = %q, want INT", got)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("Wait never returned after exit-signal")
+	}
 }
