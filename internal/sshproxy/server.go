@@ -111,7 +111,7 @@ type Server struct {
 
 	mu        sync.Mutex
 	listeners []net.Listener
-	conns     map[*ssh.ServerConn]struct{}
+	conns     map[*ssh.ServerConn]*sessionEntry
 	wg        sync.WaitGroup
 	closed    bool
 
@@ -134,22 +134,52 @@ func New(cfg Config, keys KeyLookup, users UserLookup, tokens TokenMinter, forwa
 		tokens:    tokens,
 		forwarder: forwarder,
 		logger:    logger,
-		conns:     make(map[*ssh.ServerConn]struct{}),
+		conns:     make(map[*ssh.ServerConn]*sessionEntry),
 		now:       time.Now,
 	}
 }
 
-// registerConn adds c to the live-connection set. Caller invokes the
+// registerConn adds c to the live-connection set. Registration happens
+// immediately after the handshake, before the connection has an identity,
+// so that Shutdown can tear down connections that are still authenticating.
+// attachIdentity fills in who it turned out to be. Caller invokes the
 // returned function to remove the entry on disconnect.
-func (s *Server) registerConn(c *ssh.ServerConn) func() {
+func (s *Server) registerConn(c *ssh.ServerConn, port int, clientAddr string) func() {
+	return s.registerConnWith(c, port, clientAddr, c.Close)
+}
+
+// registerConnWith is registerConn with the teardown action supplied
+// explicitly, so the registry's behavior can be exercised without a live
+// connection.
+func (s *Server) registerConnWith(c *ssh.ServerConn, port int, clientAddr string, closeConn func() error) func() {
 	s.mu.Lock()
-	s.conns[c] = struct{}{}
+	s.conns[c] = &sessionEntry{
+		port:        port,
+		clientAddr:  clientAddr,
+		connectedAt: s.now(),
+		closeConn:   closeConn,
+	}
 	s.mu.Unlock()
 	return func() {
 		s.mu.Lock()
 		delete(s.conns, c)
 		s.mu.Unlock()
 	}
+}
+
+// attachIdentity records who authenticated on c and how to tear the
+// connection down. Called after the role check passes, so only sessions
+// that reached an upstream are eligible for force-close.
+func (s *Server) attachIdentity(c *ssh.ServerConn, userID int64, email string, cancel context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.conns[c]
+	if !ok {
+		return
+	}
+	e.userID = userID
+	e.email = email
+	e.cancel = cancel
 }
 
 // Run binds one TCP listener per configured upstream and runs the accept
@@ -237,17 +267,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.closed = true
 	listeners := s.listeners
 	s.listeners = nil
-	conns := make([]*ssh.ServerConn, 0, len(s.conns))
-	for c := range s.conns {
-		conns = append(conns, c)
+	closers := make([]func() error, 0, len(s.conns))
+	for _, e := range s.conns {
+		if e.closeConn != nil {
+			closers = append(closers, e.closeConn)
+		}
 	}
 	s.mu.Unlock()
 
 	for _, l := range listeners {
 		_ = l.Close()
 	}
-	for _, c := range conns {
-		_ = c.Close()
+	for _, closeConn := range closers {
+		_ = closeConn()
 	}
 
 	done := make(chan struct{})
@@ -281,7 +313,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn, up Upstream) {
 	// Clear any pending enrollment record so the per-conn map doesn't
 	// linger after the handshake resolves.
 	s.pending.Delete(string(serverConn.SessionID()))
-	unregister := s.registerConn(serverConn)
+	unregister := s.registerConn(serverConn, up.Port, raw.RemoteAddr().String())
 	defer unregister()
 
 	if serverConn.Permissions == nil || serverConn.Permissions.Extensions == nil {
@@ -339,6 +371,13 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn, up Upstream) {
 		return
 	}
 
+	// Per-connection cancellation, recorded in the registry so an operator
+	// force-close can reach this session specifically rather than taking
+	// down every connection on the listener.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+	s.attachIdentity(serverConn, u.ID, u.Email, connCancel)
+
 	authConn := &AuthenticatedConn{
 		ServerConn:  serverConn,
 		Chans:       chans,
@@ -349,7 +388,7 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn, up Upstream) {
 		Fingerprint: fingerprint,
 		ClientAddr:  raw.RemoteAddr().String(),
 	}
-	if err := s.forwarder.Handle(ctx, authConn); err != nil {
+	if err := s.forwarder.Handle(connCtx, authConn); err != nil {
 		s.logger.Warn("ssh_forward_error",
 			"port", up.Port, "user_id", u.ID, "error", err.Error())
 	}
