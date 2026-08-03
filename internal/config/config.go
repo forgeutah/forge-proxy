@@ -43,7 +43,42 @@ type Config struct {
 	// hit auth.forgeutah.tech/ without an explicit return_to.
 	DefaultLandingURL string
 
+	// SSHUpstreams keyed by inbound listener port. Empty when the SSH
+	// subsystem is disabled (no SSH_UPSTREAMS env var set). When populated,
+	// each entry's port becomes a TCP listener and connections are
+	// authenticated then forwarded to the entry's Target. AllowedRoles is
+	// intersected with the connecting user's roles for authorization.
+	SSHUpstreams map[int]SSHUpstream
+
+	// SSHHostKeyPath is the on-disk path where the proxy's Ed25519 host
+	// key is loaded or auto-generated. Required when SSHUpstreams is
+	// non-empty.
+	SSHHostKeyPath string
+
+	// SSHCAKeyPath is the on-disk path where the proxy's Ed25519 user-CA
+	// key is loaded or auto-generated. Required when SSHUpstreams is
+	// non-empty.
+	SSHCAKeyPath string
+
+	// SSHKnownHostsPath is the path to a hand-curated OpenSSH known_hosts
+	// file used to verify outbound proxy→upstream host keys. Required
+	// when SSHUpstreams is non-empty.
+	SSHKnownHostsPath string
+
+	// SSHListenAddr is the network address each per-port listener binds.
+	// Defaults to 0.0.0.0 (bind on all interfaces) — operators can pin to
+	// a specific NIC.
+	SSHListenAddr string
+
 	LogLevel string
+}
+
+// SSHUpstream is one row in SSHUpstreams: the listening port (carried as the
+// map key), the resolved upstream target, and the allowed-roles allowlist.
+type SSHUpstream struct {
+	Port         int
+	Target       *url.URL
+	AllowedRoles []string
 }
 
 var slackTeamPattern = regexp.MustCompile(`^T[A-Z0-9]+$`)
@@ -136,6 +171,33 @@ func Load() (*Config, error) {
 		cfg.DefaultLandingURL = "https://" + cfg.AuthHost + "/"
 	}
 
+	sshRaw := strings.TrimSpace(os.Getenv("SSH_UPSTREAMS"))
+	if sshRaw != "" {
+		m, err := parseSSHUpstreams(sshRaw)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("SSH_UPSTREAMS: %v", err))
+		} else {
+			cfg.SSHUpstreams = m
+		}
+
+		// The three key paths and listen addr are only required once the
+		// subsystem is enabled. SSH_LISTEN_ADDR defaults to 0.0.0.0.
+		cfg.SSHHostKeyPath = strings.TrimSpace(os.Getenv("SSH_HOST_KEY_PATH"))
+		cfg.SSHCAKeyPath = strings.TrimSpace(os.Getenv("SSH_CA_KEY_PATH"))
+		cfg.SSHKnownHostsPath = strings.TrimSpace(os.Getenv("SSH_KNOWN_HOSTS_PATH"))
+		cfg.SSHListenAddr = getenvDefault("SSH_LISTEN_ADDR", "0.0.0.0")
+
+		if cfg.SSHHostKeyPath == "" {
+			errs = append(errs, "SSH_HOST_KEY_PATH is required when SSH_UPSTREAMS is set")
+		}
+		if cfg.SSHCAKeyPath == "" {
+			errs = append(errs, "SSH_CA_KEY_PATH is required when SSH_UPSTREAMS is set")
+		}
+		if cfg.SSHKnownHostsPath == "" {
+			errs = append(errs, "SSH_KNOWN_HOSTS_PATH is required when SSH_UPSTREAMS is set")
+		}
+	}
+
 	if len(errs) > 0 {
 		return nil, errors.New("invalid configuration: " + strings.Join(errs, "; "))
 	}
@@ -173,6 +235,169 @@ func parseUpstreams(raw string) (map[string]*url.URL, error) {
 			return nil, fmt.Errorf("entry %q: duplicate inbound host", entry)
 		}
 		m[host] = u
+	}
+	if len(m) == 0 {
+		return nil, errors.New("no valid entries")
+	}
+	return m, nil
+}
+
+var sshRoleNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// maxSSHPortRange caps how many ports one range entry may expand to. Every
+// port becomes a bound TCP listener with its own accept-loop goroutine, so
+// an unbounded range (say 1-65535) would exhaust file descriptors during
+// startup rather than failing with a readable error.
+const maxSSHPortRange = 256
+
+// parsePortSpec parses the left side of an SSH_UPSTREAMS entry, which is
+// either a single port ("2222") or an inclusive range ("2300-2310").
+// Returns the low and high bounds — equal for a single port — and whether
+// the range form was used, which determines how the target is interpreted.
+func parsePortSpec(entry, portRaw string) (lo, hi int, isRange bool, err error) {
+	parsePort := func(raw string) (int, error) {
+		p, convErr := strconv.Atoi(strings.TrimSpace(raw))
+		if convErr != nil {
+			return 0, fmt.Errorf("entry %q: invalid port %q: %v", entry, raw, convErr)
+		}
+		if p < 1 || p > 65535 {
+			return 0, fmt.Errorf("entry %q: port %d out of range (1-65535)", entry, p)
+		}
+		return p, nil
+	}
+
+	loRaw, hiRaw, isRange := strings.Cut(portRaw, "-")
+	if !isRange {
+		p, err := parsePort(portRaw)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		return p, p, false, nil
+	}
+
+	if lo, err = parsePort(loRaw); err != nil {
+		return 0, 0, true, err
+	}
+	if hi, err = parsePort(hiRaw); err != nil {
+		return 0, 0, true, err
+	}
+	if hi < lo {
+		return 0, 0, true, fmt.Errorf(
+			"entry %q: reversed port range %d-%d (low bound must not exceed high bound)",
+			entry, lo, hi)
+	}
+	if width := hi - lo + 1; width > maxSSHPortRange {
+		return 0, 0, true, fmt.Errorf(
+			"entry %q: port range spans %d ports, exceeding the %d-port limit "+
+				"(each port binds its own listener)",
+			entry, width, maxSSHPortRange)
+	}
+	return lo, hi, true, nil
+}
+
+// parseSSHUpstreams parses "port=host:port|role1,role2;port=host:port|role"
+// into a map keyed by listening port.
+//
+// The entry separator is ';' (not ','), so role lists can use ','. The
+// target-vs-role-list separator is '|' (not '='), so the port assignment
+// `port=host:port` can use '='. The grammar is documented in the plan's Key
+// Technical Decisions.
+func parseSSHUpstreams(raw string) (map[int]SSHUpstream, error) {
+	m := make(map[int]SSHUpstream)
+	for entry := range strings.SplitSeq(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		portRaw, rest, ok := strings.Cut(entry, "=")
+		if !ok {
+			return nil, fmt.Errorf("entry %q is missing '='", entry)
+		}
+		portRaw = strings.TrimSpace(portRaw)
+		rest = strings.TrimSpace(rest)
+		if portRaw == "" {
+			return nil, fmt.Errorf("entry %q has empty port", entry)
+		}
+
+		lo, hi, isRange, err := parsePortSpec(entry, portRaw)
+		if err != nil {
+			return nil, err
+		}
+
+		targetRaw, rolesRaw, ok := strings.Cut(rest, "|")
+		if !ok {
+			return nil, fmt.Errorf("entry %q: role list missing (use 'port=host:port|role1,role2')", entry)
+		}
+		targetRaw = strings.TrimSpace(targetRaw)
+		rolesRaw = strings.TrimSpace(rolesRaw)
+		if targetRaw == "" {
+			return nil, fmt.Errorf("entry %q: empty target", entry)
+		}
+		if rolesRaw == "" {
+			return nil, fmt.Errorf("entry %q: empty role list", entry)
+		}
+
+		// We accept bare "host:port" — the SSH dialer doesn't care about
+		// scheme. We still parse via url.URL so port validation lives in
+		// one place; the SSH scheme tag stays informational.
+		u, err := url.Parse("ssh://" + targetRaw)
+		if err != nil {
+			return nil, fmt.Errorf("entry %q: parse target: %v", entry, err)
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("entry %q: target missing host:port", entry)
+		}
+		if isRange {
+			// The range form is port-preserving: inbound port N forwards to
+			// host:N. An explicit target port would read as if every port in
+			// the range funnels to that one port, which is the opposite of
+			// what the range is for, so it is rejected rather than resolved
+			// to one of the two possible meanings.
+			if u.Port() != "" {
+				return nil, fmt.Errorf(
+					"entry %q: a port range derives the upstream port from the inbound port, "+
+						"so the target must be a bare host (use %q, not %q)",
+					entry, u.Hostname(), u.Host)
+			}
+		} else if u.Port() == "" {
+			return nil, fmt.Errorf("entry %q: target missing port", entry)
+		}
+
+		roles := make([]string, 0)
+		for r := range strings.SplitSeq(rolesRaw, ",") {
+			r = strings.TrimSpace(r)
+			if r == "" {
+				return nil, fmt.Errorf("entry %q: empty role name", entry)
+			}
+			if !sshRoleNameRe.MatchString(r) {
+				return nil, fmt.Errorf("entry %q: invalid role name %q (must match %s)", entry, r, sshRoleNameRe.String())
+			}
+			roles = append(roles, r)
+		}
+		if len(roles) == 0 {
+			return nil, fmt.Errorf("entry %q: empty role list", entry)
+		}
+
+		// Expand the range here so nothing downstream needs to know ranges
+		// exist: the server binds one listener per map entry either way.
+		for port := lo; port <= hi; port++ {
+			if _, exists := m[port]; exists {
+				return nil, fmt.Errorf("entry %q: duplicate port %d", entry, port)
+			}
+
+			target := u
+			if isRange {
+				// Each entry gets its own *url.URL. Sharing one pointer
+				// across the range would let a later mutation through any
+				// single entry retarget every port in it.
+				perPort, err := url.Parse(fmt.Sprintf("ssh://%s:%d", u.Hostname(), port))
+				if err != nil {
+					return nil, fmt.Errorf("entry %q: build target for port %d: %v", entry, port, err)
+				}
+				target = perPort
+			}
+			m[port] = SSHUpstream{Port: port, Target: target, AllowedRoles: roles}
+		}
 	}
 	if len(m) == 0 {
 		return nil, errors.New("no valid entries")

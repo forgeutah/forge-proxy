@@ -379,6 +379,11 @@ curl https://auth.forgeutah.tech/readyz
 | `SESSION_IDLE_TIMEOUT` | optional | Sliding idle timeout. Defaults to `336h` (14 days). Must be ≤ `SESSION_LIFETIME`. |
 | `DEFAULT_LANDING_URL` | optional | Where signed-in users land when they hit the auth host root without an explicit `return_to`. Defaults to `https://<AUTH_HOST>/`. |
 | `LOG_LEVEL` | optional | One of `debug`, `info`, `warn`, `error`. Defaults to `info`. |
+| `SSH_UPSTREAMS` | optional | Enables the [SSH proxy](#ssh-proxy). `;`-separated `port=host:port\|roles` entries, or `lowPort-highPort=host\|roles` for a [port range](#port-ranges-one-vm-many-containers). Leave empty to disable SSH entirely. |
+| `SSH_HOST_KEY_PATH` | required when SSH is enabled | Ed25519 host key the listeners present. Generated on first start; keep it on a persistent volume or clients will warn about a changed host key. |
+| `SSH_CA_KEY_PATH` | required when SSH is enabled | Ed25519 CA key used to sign short-TTL certificates for the outbound leg. Generated on first start. Its public half goes in each upstream's `TrustedUserCAKeys`. |
+| `SSH_KNOWN_HOSTS_PATH` | required when SSH is enabled | OpenSSH `known_hosts` used to verify upstream host keys. Missing or unreadable is a **startup failure** — without it the outbound leg would be trust-on-first-use. |
+| `SSH_LISTEN_ADDR` | optional | Bind address for the SSH listeners. Defaults to `0.0.0.0`. |
 | `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | optional (Litestream backup only) | The write-only R2 credential. Consumed by the Litestream sidecar's `litestream.yml`, not by the proxy binary. Omit entirely if you're not running Litestream. See [off-host backup](#off-host-backup-optional-litestream--cloudflare-r2). |
 
 ---
@@ -463,11 +468,200 @@ auto-expire. Operator must run, as part of off-boarding:
 docker exec forge-proxy forge-proxy admin force-logout user@example.com
 ```
 
+This covers HTTP sessions only. If the user also has SSH access, follow
+[Off-boarding a user (SSH)](#off-boarding-a-user-ssh) as well — SSH keys are
+tracked separately and `force-logout` does not touch them.
+
 If this step is skipped, the user retains access for up to 30 days (the
 absolute session lifetime cap). The plan's
 [Risks & Dependencies](docs/plans/2026-05-20-001-feat-forge-auth-proxy-plan.md#risks--dependencies)
 section documents this as an explicit trade-off: hitting Slack on every
 request would buy marginal benefit at this scale.
+
+---
+
+## SSH proxy
+
+The proxy can also front SSH. Each configured port is a separate SSH
+listener that authenticates the connection against a public key registered
+to a Slack-identified user, checks that user's roles, and then opens a
+*fresh* outbound SSH connection to the mapped upstream. It is a
+session-forwarding bastion, not a TCP tunnel: the proxy terminates the
+inbound session and proxies every channel and request between the two ends,
+which is what lets VSCode Remote SSH and SFTP work through it.
+
+The subsystem is off unless `SSH_UPSTREAMS` is set. Port 22 on the proxy VM
+is untouched — it stays owned by the cloud provider for host administration.
+
+### Setup
+
+1. **Allocate ports and open the firewall.** Pick ports outside the
+   ephemeral range; one per upstream box (or a contiguous range — see
+   below). Open them to the internet on the exe.dev VM.
+
+2. **Configure the listeners.** `SSH_UPSTREAMS` maps each inbound port to
+   one upstream and the roles allowed to reach it:
+
+   ```sh
+   SSH_UPSTREAMS=2222=deuce.tailnet:22|ai-dev;2223=platform.tailnet:22|admin,ops
+   ```
+
+   Entries are separated by `;` (so role lists can use `,`), and the target
+   is separated from the role list by `|` (so the port assignment can use
+   `=`).
+
+3. **Set the key paths.** `SSH_HOST_KEY_PATH` and `SSH_CA_KEY_PATH` are
+   generated on first start if absent. Put them on a persistent volume — a
+   regenerated host key makes every client print the large
+   `REMOTE HOST IDENTIFICATION HAS CHANGED` warning.
+
+4. **Distribute the CA public key.** The proxy authenticates to upstreams
+   with short-TTL certificates it signs itself, so each upstream must trust
+   the CA. The public key is logged at startup:
+
+   ```sh
+   docker logs forge-proxy | grep ssh_ca_public_key
+   ```
+
+   On every upstream box, add it to sshd:
+
+   ```sh
+   # /etc/ssh/sshd_config
+   TrustedUserCAKeys /etc/ssh/forge_ca.pub
+   AuthorizedPrincipalsCommand /usr/local/bin/forge-principal %u
+   AuthorizedPrincipalsCommandUser nobody
+   ```
+
+   The proxy presents the user's Slack email as the certificate principal,
+   so `forge-principal` maps that email to the local account the user should
+   land in. The simplest version prints the local username when the email is
+   allowed and exits non-zero otherwise.
+
+5. **Populate known_hosts.** The proxy verifies each upstream's host key on
+   the way out, and a missing or unreadable file is a **startup failure** —
+   without it the outbound leg would be trust-on-first-use.
+
+   ```sh
+   ssh-keyscan -p 22 deuce.tailnet >> /var/lib/forge-proxy/ssh/known_hosts
+   ```
+
+   Run this for every `host:port` in `SSH_UPSTREAMS`, then restart.
+
+### Port ranges: one VM, many containers
+
+When a single VM runs several containers each with its own sshd on its own
+port, a range exposes them all in one entry. The mapping is
+**port-preserving** — inbound port N forwards to the same host on port N:
+
+```sh
+SSH_UPSTREAMS=2300-2310=deuce.tailnet|ai-dev
+#   proxy :2300  ->  deuce.tailnet:2300
+#   proxy :2301  ->  deuce.tailnet:2301   ... through :2310
+```
+
+Three constraints:
+
+- **The target is a bare host.** The upstream port is always the inbound
+  port, so writing `deuce.tailnet:22` with a range is rejected rather than
+  silently reinterpreted.
+- **One role list governs the whole range.** Split into several entries if
+  different ports need different roles.
+- **Ranges are capped at 256 ports**, because each port binds its own
+  listener with its own accept loop.
+
+Both forms can appear in one value:
+
+```sh
+SSH_UPSTREAMS=2222=box.tailnet:22|ops;2300-2310=deuce.tailnet|ai-dev
+```
+
+Two things that scale with the range and are easy to miss: open the **whole
+range** on the firewall, and keyscan **every port** into `known_hosts` — the
+proxy verifies each `host:port` it dials, so scanning only the first port
+produces failures on every other port that look like a broken forwarder.
+
+```sh
+for port in $(seq 2300 2310); do
+  ssh-keyscan -p "$port" deuce.tailnet >> /var/lib/forge-proxy/ssh/known_hosts
+done
+```
+
+### First-time enrollment
+
+Users register a key by connecting once with stock `ssh`:
+
+```sh
+ssh deuce.forgeut.dev -p 2222
+```
+
+The proxy does not recognise the key, so it returns a one-time enrollment
+URL bound to that key's fingerprint. The user opens it, signs in with Slack,
+and the key is bound to their account. Subsequent connections authenticate
+normally, and VSCode Remote SSH works from then on.
+
+**Do the first connection with stock `ssh`, not VSCode.** The enrollment
+prompt arrives as a keyboard-interactive challenge, and VSCode's SSH client
+does not display those reliably — the user would see a failed connection
+with no URL.
+
+### Verification run-book (first deploy)
+
+There is no automated end-to-end test for VSCode Remote SSH. Walk this once
+after the first deploy:
+
+1. Enroll a key per the flow above; confirm `ssh_enroll_completed` appears
+   in the logs.
+2. `ssh deuce.forgeut.dev -p 2222` — confirm you land on the upstream as the
+   right local user, and that `ssh_session_opened` logs with your email.
+3. Run something that writes to stderr (`ls /nonexistent`) and confirm the
+   error text reaches your terminal.
+4. `sftp -P 2222 deuce.forgeut.dev`, then `put` and `get` a small file.
+5. Connect with VSCode Remote SSH; confirm the server installs and a folder
+   opens.
+6. Open a terminal in VSCode, resize the pane, and confirm the shell
+   reflows.
+7. Disconnect and confirm `ssh_session_closed` logs.
+
+### Off-boarding a user (SSH)
+
+The HTTP `force-logout` above does not touch SSH. To revoke SSH access:
+
+```sh
+# 1. List the user's registered keys.
+docker exec forge-proxy forge-proxy admin ssh-list-keys user@example.com
+
+# 2. Remove each fingerprint. This blocks all future connections.
+docker exec forge-proxy forge-proxy admin ssh-remove-key SHA256:...
+
+# 3. Drop sessions that are still open.
+docker restart forge-proxy
+```
+
+Step 3 is a restart because `ssh-remove-key` prevents *future*
+authentication but does not reach connections that are already established.
+Those live in the running server's memory, and `admin` runs as a separate
+process with no channel to it — `ssh-force-logout` exists but reports this
+rather than pretending to work. Restarting is the only way to drop live SSH
+sessions today.
+
+### Rotating the SSH CA key
+
+The CA signs the short-lived certificates the proxy presents upstream.
+Rotate without downtime by trusting both keys during the swap:
+
+1. Generate the new CA key at a new path:
+   ```sh
+   ssh-keygen -t ed25519 -N "" -f /var/lib/forge-proxy/ssh/ca_ed25519_key.new
+   ```
+2. Append the **new** public key to every upstream's `TrustedUserCAKeys`
+   file, keeping the old one. Reload sshd on each. Both CAs are now trusted.
+3. Point `SSH_CA_KEY_PATH` at the new key and restart the proxy.
+4. Confirm connections still work through every configured port.
+5. Remove the old public key from each upstream's `TrustedUserCAKeys` and
+   reload sshd.
+
+Doing step 3 before step 2 locks every user out until the upstreams catch
+up, since certificates signed by the new CA would be rejected everywhere.
 
 ---
 
