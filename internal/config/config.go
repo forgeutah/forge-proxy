@@ -194,10 +194,14 @@ func Load() (*Config, error) {
 //
 // The entry separator is ';' (not ','), so role lists can use ','. The
 // target-vs-role-list separator is '|' (not '='), so the host assignment
-// `host=url` can use '='. This is the same grammar SSH_UPSTREAMS uses, with
-// one difference: the role list is optional here. An entry with no '|' is
+// `host=url` can use '='. The role list is optional: an entry with no '|' is
 // ungated and reachable by any authenticated member, which is what every
 // pre-gating entry means.
+//
+// The separator choice matches the grammar the SSH listener uses for its own
+// per-upstream role lists. That listener is not on this branch yet, so the
+// symmetry is intentional but not yet compile-enforced; when it lands, the
+// two parsers should share one role-name pattern.
 //
 // The ';' separator is a breaking change from the original ','-separated
 // form. See legacyEntryErr for why an un-migrated value cannot be allowed to
@@ -213,7 +217,14 @@ func parseUpstreams(raw string) (map[string]Upstream, error) {
 		if !ok {
 			return nil, fmt.Errorf("entry %q is missing '='", entry)
 		}
-		host = strings.TrimSpace(host)
+		// Lowercase here, not just at map-build time. Host comparison is
+		// case-insensitive (RFC 7230 §5.4) and proxy.NewHostMap lowercases
+		// its keys, so two entries differing only in case collapse to one
+		// there. Without normalising before the duplicate check below, that
+		// collapse is silent and its winner is decided by Go's randomised
+		// map iteration order — a gated entry can lose its role list on an
+		// unrelated restart.
+		host = strings.ToLower(strings.TrimSpace(host))
 		rest = strings.TrimSpace(rest)
 		if host == "" || rest == "" {
 			return nil, fmt.Errorf("entry %q has empty host or url", entry)

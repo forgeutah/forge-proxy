@@ -134,6 +134,18 @@ func TestLoad_UpstreamsParsing(t *testing.T) {
 		{"duplicate host", "deuce.forgeutah.tech=http://a:1;deuce.forgeutah.tech=http://b:2", "duplicate inbound host"},
 		{"empty host", "=http://deuce:8080", "empty host or url"},
 		{"empty url", "deuce.forgeutah.tech=", "empty host or url"},
+		{"empty url with role list", "deuce.forgeutah.tech=|ai-dev", "empty upstream url"},
+
+		// Hosts are compared case-insensitively and the host map lowercases
+		// its keys, so a case-differing duplicate would otherwise collapse
+		// to one entry with a randomised winner.
+		{"duplicate host differing in case", "Deuce.forgeutah.tech=http://a:1|ai-dev;deuce.forgeutah.tech=http://b:2", "duplicate inbound host"},
+
+		// A comma anywhere in the target trips the legacy guard. Upstream
+		// targets are origins, so this trade-off is deliberate: catching an
+		// un-migrated config matters more than supporting a comma in a
+		// query string. Pinned so the choice is revisited on purpose.
+		{"comma inside a single target", "deuce.forgeutah.tech=http://deuce:8080/?a=1,2", "old comma-separated format"},
 		{"empty role list", "deuce.forgeutah.tech=http://deuce:8080|", "empty role list"},
 		{"blank role name", "deuce.forgeutah.tech=http://deuce:8080|ai-dev,,admin", "empty role name"},
 		{"role with space", "deuce.forgeutah.tech=http://deuce:8080|ai dev", "invalid role name"},
@@ -194,6 +206,21 @@ func TestLoad_UpstreamsParsed(t *testing.T) {
 	}
 	if ungated.Gated() {
 		t.Error("platform entry should report ungated")
+	}
+}
+
+// TestLoad_UpstreamsHostLowercased pins that host keys are normalised at
+// parse time. The proxy's host map lowercases its keys, so an entry stored
+// under a mixed-case key here would be unreachable.
+func TestLoad_UpstreamsHostLowercased(t *testing.T) {
+	env := validEnv(t)
+	env["UPSTREAMS"] = "Deuce.ForgeUtah.Tech=http://deuce:8080|ai-dev"
+	cfg, err := setEnv(t, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := cfg.UpstreamMap["deuce.forgeutah.tech"]; !ok {
+		t.Fatalf("mixed-case host not normalised; keys present: %v", cfg.UpstreamMap)
 	}
 }
 

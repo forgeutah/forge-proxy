@@ -331,9 +331,12 @@ func (p *Proxy) writeRoleDenied(w http.ResponseWriter, r *http.Request, u *user.
 	// Logged by user_id, not email — every other log site in the proxy keys
 	// on the stable ID, and an operator maps it back with `admin list-users`
 	// rather than having addresses sitting in the log stream.
+	// Path, not RequestURI — the query string can carry invite tokens and
+	// similar one-time secrets, and the request log's "path" field
+	// (internal/httplog) is Path for the same reason.
 	httplog.FromContext(r.Context()).Warn("proxy: role denied",
 		"host", r.Host,
-		"path", r.URL.RequestURI(),
+		"path", r.URL.Path,
 		"user_id", u.ID,
 		"required_roles", strings.Join(required, ","),
 		"user_roles", strings.Join(u.Roles, ","))

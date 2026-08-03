@@ -442,6 +442,18 @@ nothing unless the entry lists it.
 
 To reopen an app, drop the `|role1,role2` suffix and restart.
 
+**The gate is per inbound hostname, not per upstream.** If two entries point
+at the same upstream URL, each needs its own role list — otherwise the
+un-listed hostname is an open side door to the same app:
+
+```sh
+# WRONG — deuce-legacy reaches the same app with no gate
+UPSTREAMS=deuce.forgeutah.tech=http://deuce:8080|ai-dev;deuce-legacy.forgeutah.tech=http://deuce:8080
+
+# RIGHT — both hostnames carry the list
+UPSTREAMS=deuce.forgeutah.tech=http://deuce:8080|ai-dev;deuce-legacy.forgeutah.tech=http://deuce:8080|ai-dev
+```
+
 ### Migrating `UPSTREAMS` to the new format
 
 Role lists made `,` ambiguous, so entries are now separated by `;`:
@@ -458,6 +470,19 @@ The proxy refuses to start on the old format rather than guessing, so **edit
 the env file before restarting** — on a systemd host that is
 `/etc/forge-proxy.env`, read via `EnvironmentFile`. Restarting first leaves
 every app behind the proxy unreachable until the file is fixed.
+
+Validation is all-or-nothing: one bad entry rejects the whole map, so a single
+typo takes down every app, not just the one you edited. Check the edit before
+you restart — any `admin` subcommand loads and validates config first, so it
+doubles as a config linter:
+
+```sh
+set -a; . /etc/forge-proxy.env; set +a
+forge-proxy admin list-users >/dev/null && echo "UPSTREAMS OK"
+```
+
+A grammar mistake prints the same error the proxy would fail to start with,
+without touching the running service.
 
 ---
 
