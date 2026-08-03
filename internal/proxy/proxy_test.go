@@ -181,8 +181,11 @@ func newProxyFixture(t *testing.T) *proxyFixture {
 		BaseDomain:   "forgeutah.tech",
 		CookieDomain: ".forgeutah.tech",
 		ProxySecret:  "test-proxy-secret-32chars-min-padding",
-		UpstreamMap: map[string]*url.URL{
-			"deuce.forgeutah.tech": upstreamURL,
+		// Ungated by default — the pre-gating shape, so every existing test
+		// exercises the unrestricted path. Tests that care about the gate
+		// call requireRoles.
+		UpstreamMap: map[string]config.Upstream{
+			"deuce.forgeutah.tech": {Target: upstreamURL},
 		},
 	}
 
@@ -216,6 +219,26 @@ func newProxyFixture(t *testing.T) *proxyFixture {
 		sessionID: sess.ID,
 		proxy:     New(cfg, sessions, users),
 	}
+}
+
+// requireRoles gates the fixture's upstream behind the given roles and
+// rebuilds the proxy so the new host map takes effect. NewHostMap copies the
+// config map at construction time, so mutating cfg alone would not reach the
+// running proxy.
+func (f *proxyFixture) requireRoles(roles ...string) {
+	entry := f.cfg.UpstreamMap["deuce.forgeutah.tech"]
+	entry.RequiredRoles = roles
+	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = entry
+	f.proxy = New(f.cfg, f.sessions, f.users)
+}
+
+// setUpstreamTarget repoints the fixture's upstream and rebuilds the proxy,
+// preserving whatever role gating is configured.
+func (f *proxyFixture) setUpstreamTarget(target *url.URL) {
+	entry := f.cfg.UpstreamMap["deuce.forgeutah.tech"]
+	entry.Target = target
+	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = entry
+	f.proxy = New(f.cfg, f.sessions, f.users)
 }
 
 // signedInRequest builds a request carrying the fixture's session cookie.
@@ -365,8 +388,7 @@ func TestProxy_UpstreamReturns500_PassedThrough(t *testing.T) {
 	upstreamURL, _ := url.Parse(upstream.URL)
 
 	f := newProxyFixture(t)
-	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = upstreamURL
-	f.proxy = New(f.cfg, f.sessions, f.users)
+	f.setUpstreamTarget(upstreamURL)
 
 	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
 	w := httptest.NewRecorder()
@@ -390,8 +412,7 @@ func TestProxy_UpstreamUnreachable_502(t *testing.T) {
 	deadURL, _ := url.Parse(deadSrv.URL)
 	deadSrv.Close() // shut it down so dials fail.
 
-	f.cfg.UpstreamMap["deuce.forgeutah.tech"] = deadURL
-	f.proxy = New(f.cfg, f.sessions, f.users)
+	f.setUpstreamTarget(deadURL)
 
 	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
 	w := httptest.NewRecorder()
@@ -528,5 +549,221 @@ func TestProxy_ReplacesXForwardedFor(t *testing.T) {
 	}
 	if !strings.Contains(xff, "192.0.2.1") {
 		t.Fatalf("X-Forwarded-For = %q, expected to contain server-observed remote IP 192.0.2.1", xff)
+	}
+}
+
+// --- Role gate -------------------------------------------------------------
+//
+// The gate's whole purpose is what does *not* happen: a user without a
+// required role must never reach the upstream. Every denial test below
+// asserts the upstream stub recorded zero requests, which is the only
+// evidence that the check ran before the forward rather than after it.
+
+// TestProxy_UngatedUpstream_Forwards_CoversAE1 pins the backward-compatible
+// path: an entry with no required roles behaves exactly as it did before
+// gating existed, contract headers included.
+func TestProxy_UngatedUpstream_Forwards_CoversAE1(t *testing.T) {
+	f := newProxyFixture(t) // ungated by default
+	f.users.setRoles(f.user.ID, nil)
+
+	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (ungated upstream must forward)", w.Code)
+	}
+	if len(*f.received) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(*f.received))
+	}
+	if _, ok := (*f.received)[0].Header["X-Forge-Roles"]; !ok {
+		t.Error("X-Forge-Roles missing; apps still authorize on it")
+	}
+}
+
+// TestProxy_RoleDenied_NeverContactsUpstream_CoversAE2 is the core gate
+// assertion: empty intersection means 403 and zero upstream contact.
+func TestProxy_RoleDenied_NeverContactsUpstream_CoversAE2(t *testing.T) {
+	f := newProxyFixture(t)
+	f.requireRoles("ai-dev", "admin")
+	f.users.setRoles(f.user.ID, []string{"member"})
+
+	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if len(*f.received) != 0 {
+		t.Fatalf("upstream saw %d requests, want 0 — the gate must run before forwarding", len(*f.received))
+	}
+
+	body := w.Body.String()
+	for _, want := range []string{"ai-dev", "admin", f.user.Email, "deuce.forgeutah.tech"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("denial page missing %q; body:\n%s", want, body)
+		}
+	}
+}
+
+// TestProxy_RoleGate_AnyOneRoleSuffices_CoversAE3 pins "any of", not "all of".
+func TestProxy_RoleGate_AnyOneRoleSuffices_CoversAE3(t *testing.T) {
+	f := newProxyFixture(t)
+	f.requireRoles("ai-dev", "admin")
+	f.users.setRoles(f.user.ID, []string{"admin"})
+
+	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (one matching role is enough)", w.Code)
+	}
+	if len(*f.received) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(*f.received))
+	}
+}
+
+// TestProxy_RoleGate_AdminIsNotBypass_CoversAE4 pins that no role name is
+// privileged. "admin" grants nothing unless the entry lists it.
+func TestProxy_RoleGate_AdminIsNotBypass_CoversAE4(t *testing.T) {
+	f := newProxyFixture(t)
+	f.requireRoles("ai-dev")
+	f.users.setRoles(f.user.ID, []string{"admin"})
+
+	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 — admin must not bypass an allowlist that omits it", w.Code)
+	}
+	if len(*f.received) != 0 {
+		t.Fatalf("upstream saw %d requests, want 0", len(*f.received))
+	}
+}
+
+// TestProxy_RoleGate_RolelessUser_Denied covers the common pre-grant state:
+// a signed-in member with no roles at all. The page must render its empty
+// role list without erroring.
+func TestProxy_RoleGate_RolelessUser_Denied(t *testing.T) {
+	f := newProxyFixture(t)
+	f.requireRoles("ai-dev")
+	f.users.setRoles(f.user.ID, nil)
+
+	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if len(*f.received) != 0 {
+		t.Fatalf("upstream saw %d requests, want 0", len(*f.received))
+	}
+	if body := w.Body.String(); !strings.Contains(body, "ai-dev") {
+		t.Errorf("denial page should still name the required role; body:\n%s", body)
+	}
+}
+
+// TestProxy_RoleGate_ExactComparison pins that role matching is exact — not
+// prefix, not substring. A near-miss role name must not open a gated app.
+func TestProxy_RoleGate_ExactComparison(t *testing.T) {
+	cases := []struct {
+		name      string
+		required  string
+		userRole  string
+		wantAllow bool
+	}{
+		{"exact match allows", "ai-dev", "ai-dev", true},
+		{"longer user role denied", "ai-dev", "ai-dev-admin", false},
+		{"shorter user role denied", "ai-dev", "ai", false},
+		{"case mismatch denied", "ai-dev", "AI-DEV", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newProxyFixture(t)
+			f.requireRoles(tc.required)
+			f.users.setRoles(f.user.ID, []string{tc.userRole})
+
+			r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+			w := httptest.NewRecorder()
+			f.proxy.ServeHTTP(w, r)
+
+			if tc.wantAllow && w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			if !tc.wantAllow && w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", w.Code)
+			}
+		})
+	}
+}
+
+// TestProxy_RoleGate_RunsAfterAuth verifies ordering: an unauthenticated
+// request to a gated host still redirects to login rather than leaking the
+// denial page (which names the required roles) to an anonymous caller.
+func TestProxy_RoleGate_RunsAfterAuth(t *testing.T) {
+	f := newProxyFixture(t)
+	f.requireRoles("ai-dev")
+
+	r := httptest.NewRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo", nil) // no cookie
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 to login", w.Code)
+	}
+	if body := w.Body.String(); strings.Contains(body, "ai-dev") {
+		t.Error("anonymous caller must not see the required-roles list")
+	}
+	if len(*f.received) != 0 {
+		t.Fatalf("upstream saw %d requests, want 0", len(*f.received))
+	}
+}
+
+// TestProxy_DenialPage_NoStore pins the cache header. The page reflects role
+// state that changes the moment an operator grants access; a cached 403 would
+// keep showing the denial after the grant.
+func TestProxy_DenialPage_NoStore(t *testing.T) {
+	f := newProxyFixture(t)
+	f.requireRoles("ai-dev")
+	f.users.setRoles(f.user.ID, []string{"member"})
+
+	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	if got := w.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+// TestProxy_DenialPage_EscapesMetacharacters is defence in depth. Config
+// validation rejects role names outside [A-Za-z0-9_-], but the page must not
+// depend on that — a HostMap built by any other path must still render safe
+// HTML.
+func TestProxy_DenialPage_EscapesMetacharacters(t *testing.T) {
+	f := newProxyFixture(t)
+	f.requireRoles(`<script>alert(1)</script>`)
+	f.users.setRoles(f.user.ID, []string{`<img src=x onerror=alert(2)>`})
+
+	r := f.signedInRequest(http.MethodGet, "https://deuce.forgeutah.tech/foo")
+	w := httptest.NewRecorder()
+	f.proxy.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if strings.Contains(body, "<script>") {
+		t.Error("required role rendered unescaped")
+	}
+	if strings.Contains(body, "<img src=x") {
+		t.Error("user role rendered unescaped")
+	}
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Errorf("expected escaped role in body:\n%s", body)
 	}
 }

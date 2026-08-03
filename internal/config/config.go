@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -27,9 +28,13 @@ type Config struct {
 
 	DBPath string
 
-	// UpstreamMap maps inbound Host header to upstream URL.
-	// Built from env var UPSTREAMS=host=url,host=url
-	UpstreamMap map[string]*url.URL
+	// UpstreamMap maps inbound Host header to its upstream target and the
+	// roles a signed-in user must hold to reach it.
+	//
+	// Built from env var UPSTREAMS=host=url|role1,role2;host=url — see
+	// parseUpstreams for the grammar. An entry with no role list is
+	// reachable by any authenticated workspace member.
+	UpstreamMap map[string]Upstream
 
 	SessionLifetime    time.Duration
 	SessionIdleTimeout time.Duration
@@ -73,6 +78,41 @@ type Config struct {
 	LogLevel string
 }
 
+// Upstream is one entry in UpstreamMap: where to forward, and which roles
+// gate the forward.
+//
+// RequiredRoles is an allowlist intersected with the signed-in user's roles
+// before anything is proxied. Empty means ungated — any authenticated
+// workspace member reaches the app, which is the pre-gating behaviour and
+// the default for an entry that omits the role list.
+type Upstream struct {
+	Target        *url.URL
+	RequiredRoles []string
+}
+
+// Gated reports whether this upstream restricts access by role. An ungated
+// upstream skips the role check entirely rather than intersecting against an
+// empty allowlist (which would deny everyone).
+func (u Upstream) Gated() bool { return len(u.RequiredRoles) > 0 }
+
+// Permits reports whether any of the user's roles appears in this upstream's
+// allowlist. Ungated upstreams permit everyone.
+//
+// The allowlist is "any of", not "all of": one matching role is sufficient.
+// Comparison is exact — "ai-dev-admin" does not satisfy a requirement for
+// "ai-dev".
+func (u Upstream) Permits(userRoles []string) bool {
+	if !u.Gated() {
+		return true
+	}
+	for _, have := range userRoles {
+		if slices.Contains(u.RequiredRoles, have) {
+			return true
+		}
+	}
+	return false
+}
+
 // SSHUpstream is one row in SSHUpstreams: the listening port (carried as the
 // map key), the resolved upstream target, and the allowed-roles allowlist.
 type SSHUpstream struct {
@@ -82,6 +122,14 @@ type SSHUpstream struct {
 }
 
 var slackTeamPattern = regexp.MustCompile(`^T[A-Z0-9]+$`)
+
+// roleNameRe is the canonical role-name shape for every role list this
+// package parses — both the HTTP UPSTREAMS allowlist and the SSH_UPSTREAMS
+// one. It mirrors internal/user's roleNameRe rather than importing it: config
+// must not depend on the user store. Sharing one pattern across the two
+// parsers is the point — a role name accepted by one listener but not the
+// other would be a confusing way to be denied.
+var roleNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // Load reads configuration from environment and returns a validated Config.
 // Returns an error naming the specific environment variable on failure.
@@ -138,7 +186,7 @@ func Load() (*Config, error) {
 
 	upstreamsRaw := strings.TrimSpace(os.Getenv("UPSTREAMS"))
 	if upstreamsRaw == "" {
-		errs = append(errs, "UPSTREAMS is required (format: host=url,host=url)")
+		errs = append(errs, "UPSTREAMS is required (format: host=url;host=url|role1,role2)")
 	} else {
 		m, err := parseUpstreams(upstreamsRaw)
 		if err != nil {
@@ -204,23 +252,57 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// parseUpstreams parses "host1=url1,host2=url2" into a map.
-func parseUpstreams(raw string) (map[string]*url.URL, error) {
-	m := make(map[string]*url.URL)
-	for entry := range strings.SplitSeq(raw, ",") {
+// parseUpstreams parses "host=url|role1,role2;host=url" into a map keyed by
+// inbound host.
+//
+// The entry separator is ';' (not ','), so role lists can use ','. The
+// target-vs-role-list separator is '|' (not '='), so the host assignment
+// `host=url` can use '='. The role list is optional: an entry with no '|' is
+// ungated and reachable by any authenticated member, which is what every
+// pre-gating entry means.
+//
+// The separator choice matches parseSSHUpstreams, which applies the same
+// grammar to its own per-upstream role lists. Both share roleNameRe, so a
+// role name valid for one listener is valid for the other.
+//
+// The ';' separator is a breaking change from the original ','-separated
+// form. See legacyEntryErr for why an un-migrated value cannot be allowed to
+// fall through to url.Parse.
+func parseUpstreams(raw string) (map[string]Upstream, error) {
+	m := make(map[string]Upstream)
+	for entry := range strings.SplitSeq(raw, ";") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
-		host, rawURL, ok := strings.Cut(entry, "=")
+		host, rest, ok := strings.Cut(entry, "=")
 		if !ok {
 			return nil, fmt.Errorf("entry %q is missing '='", entry)
 		}
-		host = strings.TrimSpace(host)
-		rawURL = strings.TrimSpace(rawURL)
-		if host == "" || rawURL == "" {
+		// Lowercase here, not just at map-build time. Host comparison is
+		// case-insensitive (RFC 7230 §5.4) and proxy.NewHostMap lowercases
+		// its keys, so two entries differing only in case collapse to one
+		// there. Without normalising before the duplicate check below, that
+		// collapse is silent and its winner is decided by Go's randomised
+		// map iteration order — a gated entry can lose its role list on an
+		// unrelated restart.
+		host = strings.ToLower(strings.TrimSpace(host))
+		rest = strings.TrimSpace(rest)
+		if host == "" || rest == "" {
 			return nil, fmt.Errorf("entry %q has empty host or url", entry)
 		}
+
+		// The role list is optional; its absence means ungated.
+		rawURL, rolesRaw, gated := strings.Cut(rest, "|")
+		rawURL = strings.TrimSpace(rawURL)
+		rolesRaw = strings.TrimSpace(rolesRaw)
+		if rawURL == "" {
+			return nil, fmt.Errorf("entry %q: empty upstream url", entry)
+		}
+		if err := legacyEntryErr(entry, rawURL); err != nil {
+			return nil, err
+		}
+
 		u, err := url.Parse(rawURL)
 		if err != nil {
 			return nil, fmt.Errorf("entry %q: %v", entry, err)
@@ -234,7 +316,25 @@ func parseUpstreams(raw string) (map[string]*url.URL, error) {
 		if _, exists := m[host]; exists {
 			return nil, fmt.Errorf("entry %q: duplicate inbound host", entry)
 		}
-		m[host] = u
+
+		var roles []string
+		if gated {
+			if rolesRaw == "" {
+				return nil, fmt.Errorf("entry %q: empty role list (omit the '|' entirely to leave the app ungated)", entry)
+			}
+			for r := range strings.SplitSeq(rolesRaw, ",") {
+				r = strings.TrimSpace(r)
+				if r == "" {
+					return nil, fmt.Errorf("entry %q: empty role name", entry)
+				}
+				if !roleNameRe.MatchString(r) {
+					return nil, fmt.Errorf("entry %q: invalid role name %q (must match %s)", entry, r, roleNameRe.String())
+				}
+				roles = append(roles, r)
+			}
+		}
+
+		m[host] = Upstream{Target: u, RequiredRoles: roles}
 	}
 	if len(m) == 0 {
 		return nil, errors.New("no valid entries")
@@ -242,7 +342,32 @@ func parseUpstreams(raw string) (map[string]*url.URL, error) {
 	return m, nil
 }
 
-var sshRoleNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+// legacyEntryErr rejects an UPSTREAMS value still written in the original
+// ','-separated entry form, naming the migration.
+//
+// This guard is load-bearing rather than defensive. Splitting the legacy form
+// on ';' yields a single entry whose target is the entire remainder — e.g.
+// "http://deuce:8080,platform.forgeut.dev=http://platform:8080". url.Parse
+// accepts that as scheme "http" with host
+// "deuce:8080,platform.forgeut.dev=http:", so it passes both the scheme and
+// non-empty-host checks below. Without this guard the proxy boots
+// "successfully" with one garbage upstream and every other app silently
+// unrouted, which is far worse than refusing to start.
+//
+// The check is on ',' alone, not also '='. ',' was the legacy entry
+// separator, so it is always present in an un-migrated multi-entry value; '='
+// only ever shows up as a side effect of the same absorption and adds no
+// detection power, while rejecting any upstream URL carrying a query string.
+func legacyEntryErr(entry, rawURL string) error {
+	if !strings.Contains(rawURL, ",") {
+		return nil
+	}
+	return fmt.Errorf(
+		"entry %q looks like the old comma-separated format; entries are now separated by ';' and an optional role list follows '|' "+
+			"(old: host=url,host=url — new: host=url;host=url|role1,role2)",
+		entry,
+	)
+}
 
 // maxSSHPortRange caps how many ports one range entry may expand to. Every
 // port becomes a bound TCP listener with its own accept-loop goroutine, so
@@ -369,8 +494,8 @@ func parseSSHUpstreams(raw string) (map[int]SSHUpstream, error) {
 			if r == "" {
 				return nil, fmt.Errorf("entry %q: empty role name", entry)
 			}
-			if !sshRoleNameRe.MatchString(r) {
-				return nil, fmt.Errorf("entry %q: invalid role name %q (must match %s)", entry, r, sshRoleNameRe.String())
+			if !roleNameRe.MatchString(r) {
+				return nil, fmt.Errorf("entry %q: invalid role name %q (must match %s)", entry, r, roleNameRe.String())
 			}
 			roles = append(roles, r)
 		}

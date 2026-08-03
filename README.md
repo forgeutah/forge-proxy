@@ -75,7 +75,7 @@ no separate auth, no session cookies, no token exchange.
 | `X-Forge-Email` | string | `alice@example.com` | Slack-verified. Refreshed on every sign-in. |
 | `X-Forge-Name` | string | `Alice` or `UTF-8''Al%C3%ADce` | Display name. Pure-ASCII passes through verbatim. Non-ASCII (emoji, accents) is RFC 8187 encoded as `UTF-8''<percent-encoded>`. Most apps can display either form as-is; if you need to decode, the standard "strip the `UTF-8''` prefix and percent-decode" pipeline works. |
 | `X-Forge-Avatar` | URL | `https://avatars.slack-edge.com/…` | Slack profile image. Safe to render directly. |
-| `X-Forge-Roles` | csv | `admin,founder` | Comma-separated. Empty string means no roles. Roles are user-defined — managed via `forge-proxy admin set-roles`. Treat as opaque tags and define your own authorization rules on top. |
+| `X-Forge-Roles` | csv | `admin,founder` | Comma-separated. Empty string means no roles. Roles are user-defined — managed via `forge-proxy admin set-roles`. Treat as opaque tags and define your own authorization rules on top. The proxy may also refuse before your app is reached if its `UPSTREAMS` entry declares required roles (see [restricting an app by role](#restricting-an-app-by-role)) — that gate is additive, so keep enforcing your own rules regardless. |
 | `X-Forge-Slack-User-Id` | string | `U0R7G…` | The Slack user ID. Useful if you call the Slack API on the user's behalf. |
 | `X-Forge-Slack-Team-Id` | string | `T0R7G…` | The Slack workspace ID. The proxy already enforces a single configured workspace, but apps can double-check. |
 
@@ -373,7 +373,7 @@ curl https://auth.forgeutah.tech/readyz
 | `SLACK_CLIENT_SECRET` | yes | From the Slack app. |
 | `SLACK_TEAM_ID` | yes | The `T`-prefixed workspace ID (e.g. `T0R7GR`). |
 | `DB_PATH` | yes | Path to the SQLite file (e.g. `/data/forge.db`). Parent directory must exist and be writable by the running user. |
-| `UPSTREAMS` | yes | Comma-separated `host=url` pairs. Example: `deuce.forgeutah.tech=http://deuce:8080,platform.forgeutah.tech=http://platform:8080`. |
+| `UPSTREAMS` | yes | Semicolon-separated `host=url` pairs, each with an optional `\|role1,role2` allowlist. Example: `deuce.forgeutah.tech=http://deuce:8080\|ai-dev,admin;platform.forgeutah.tech=http://platform:8080`. An entry with a role list is reachable only by users holding at least one of those roles; an entry without one is reachable by any signed-in member. See [restricting an app by role](#restricting-an-app-by-role). |
 | `PROXY_SECRET` | yes | At least 32 characters of random. Generate with `openssl rand -hex 32`. Same value must be configured on every upstream app. |
 | `SESSION_LIFETIME` | optional | Absolute cap on session age. Defaults to `720h` (30 days). |
 | `SESSION_IDLE_TIMEOUT` | optional | Sliding idle timeout. Defaults to `336h` (14 days). Must be ≤ `SESSION_LIFETIME`. |
@@ -400,8 +400,11 @@ section. The operator-facing summary:
    deployment.
 2. Add the app's tailnet hostname to the tailnet, tagged so the
    `tag:forge-proxy` ACL grant covers it.
-3. Append the app to the `UPSTREAMS` env var
-   (`new-app.forgeutah.tech=http://new-app:8080`) and restart the proxy.
+3. Append the app to the `UPSTREAMS` env var, separating entries with `;`
+   (`;new-app.forgeutah.tech=http://new-app:8080`) and restart the proxy.
+   To restrict it to certain roles, append `|role1,role2` — but read
+   [restricting an app by role](#restricting-an-app-by-role) first, because
+   the order of operations matters.
 4. Smoke-test from a signed-in browser before the DNS swing: hit
    `new-app.forgeutah.tech` via the proxy and confirm headers arrive.
 5. Lower the DNS TTL on `new-app.forgeutah.tech` to 60s, then swing it from
@@ -411,6 +414,80 @@ section. The operator-facing summary:
 
 Cut over one app at a time. Each cutover takes ~24-48 hours of observation
 before ACL tightening.
+
+---
+
+## Restricting an app by role
+
+By default every signed-in workspace member can reach every configured app,
+and each app decides for itself what to do with `X-Forge-Roles`. Adding a
+role list to an app's `UPSTREAMS` entry makes the proxy refuse first — a user
+without a matching role gets a 403 page naming the roles they'd need, and the
+app never sees the request.
+
+This is defense in depth, not a replacement: apps still receive
+`X-Forge-Roles` and should keep enforcing their own rules.
+
+**Grant the roles before you add the list.** The proxy has no self-serve
+access request yet, so anyone who does not already hold a listed role is
+locked out until an admin grants it by hand:
+
+```sh
+# 1. Grant first — everyone who should keep access.
+forge-proxy admin set-roles alice@example.com ai-dev
+forge-proxy admin set-roles bob@example.com ai-dev
+
+# 2. Then gate, and restart.
+#    UPSTREAMS=deuce.forgeutah.tech=http://deuce:8080|ai-dev;...
+```
+
+Matching is "any one of" — a user holding any single listed role gets in.
+Role names are compared exactly, and no name is special: `admin` grants
+nothing unless the entry lists it.
+
+To reopen an app, drop the `|role1,role2` suffix and restart.
+
+**The gate is per inbound hostname, not per upstream.** If two entries point
+at the same upstream URL, each needs its own role list — otherwise the
+un-listed hostname is an open side door to the same app:
+
+```sh
+# WRONG — deuce-legacy reaches the same app with no gate
+UPSTREAMS=deuce.forgeutah.tech=http://deuce:8080|ai-dev;deuce-legacy.forgeutah.tech=http://deuce:8080
+
+# RIGHT — both hostnames carry the list
+UPSTREAMS=deuce.forgeutah.tech=http://deuce:8080|ai-dev;deuce-legacy.forgeutah.tech=http://deuce:8080|ai-dev
+```
+
+### Migrating `UPSTREAMS` to the new format
+
+Role lists made `,` ambiguous, so entries are now separated by `;`:
+
+```sh
+# Old
+UPSTREAMS=deuce.forgeutah.tech=http://deuce:8080,platform.forgeutah.tech=http://platform:8080
+
+# New — same behaviour, both apps still open to any signed-in member
+UPSTREAMS=deuce.forgeutah.tech=http://deuce:8080;platform.forgeutah.tech=http://platform:8080
+```
+
+The proxy refuses to start on the old format rather than guessing, so **edit
+the env file before restarting** — on a systemd host that is
+`/etc/forge-proxy.env`, read via `EnvironmentFile`. Restarting first leaves
+every app behind the proxy unreachable until the file is fixed.
+
+Validation is all-or-nothing: one bad entry rejects the whole map, so a single
+typo takes down every app, not just the one you edited. Check the edit before
+you restart — any `admin` subcommand loads and validates config first, so it
+doubles as a config linter:
+
+```sh
+set -a; . /etc/forge-proxy.env; set +a
+forge-proxy admin list-users >/dev/null && echo "UPSTREAMS OK"
+```
+
+A grammar mistake prints the same error the proxy would fail to start with,
+without touching the running service.
 
 ---
 
