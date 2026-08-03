@@ -289,22 +289,18 @@ func proxyChannel(_ context.Context, clientChan ssh.Channel, clientReqs <-chan *
 	// closed without exit status (golang/go#29733).
 	upReqsDone := make(chan struct{})
 
+	// Held while a client request is being forwarded upstream and its
+	// reply written back. Teardown takes it before closing so a reply the
+	// client is still blocked on cannot be cut off mid-flight -- see the
+	// close sequence at the bottom of this function.
+	var replying sync.Mutex
+
 	// Request loop: client → upstream. One goroutine per direction keeps
 	// requests ordered relative to each other on the wire.
 	go func() {
 		defer drain.Done()
 		for r := range clientReqs {
-			if r.Type == "auth-agent-req@openssh.com" {
-				logger.Info("ssh_agent_forwarding_declined")
-				if r.WantReply {
-					_ = r.Reply(false, nil)
-				}
-				continue
-			}
-			ok, _ := upChan.SendRequest(r.Type, r.WantReply, r.Payload)
-			if r.WantReply {
-				_ = r.Reply(ok, nil)
-			}
+			forwardClientRequest(r, upChan, &replying, logger)
 		}
 	}()
 
@@ -372,10 +368,41 @@ func proxyChannel(_ context.Context, clientChan ssh.Channel, clientReqs <-chan *
 	// that ended stage 1 makes both of these return promptly.
 	fromUpstream.Wait()
 
-	// Stage 3: closing is what releases the drain group.
+	// Stage 3: close, which is what releases the drain group.
+	//
+	// Take the reply lock first. A request the client is still waiting on
+	// may be mid-flight in the loop above: forwarded upstream, answered,
+	// but not yet replied back. Closing in that window drops the reply and
+	// the client's request fails with a bare EOF. It is easy to hit --
+	// a fast command finishes and closes the upstream channel in well
+	// under a millisecond, racing the reply to its own exec request.
+	replying.Lock()
 	_ = clientChan.Close()
 	_ = upChan.Close()
+	replying.Unlock()
+
 	drain.Wait()
+}
+
+// forwardClientRequest forwards one client channel request upstream and
+// relays the answer back. replying is held for the whole forward-and-reply
+// so teardown cannot close the channel between the two.
+func forwardClientRequest(r *ssh.Request, upChan ssh.Channel, replying *sync.Mutex, logger *slog.Logger) {
+	replying.Lock()
+	defer replying.Unlock()
+
+	if r.Type == "auth-agent-req@openssh.com" {
+		logger.Info("ssh_agent_forwarding_declined")
+		if r.WantReply {
+			_ = r.Reply(false, nil)
+		}
+		return
+	}
+
+	ok, _ := upChan.SendRequest(r.Type, r.WantReply, r.Payload)
+	if r.WantReply {
+		_ = r.Reply(ok, nil)
+	}
 }
 
 // forwardGlobalRequests reads from in and forwards each request to the

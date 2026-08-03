@@ -1189,3 +1189,41 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	defer l.mu.Unlock()
 	return l.w.Write(p)
 }
+
+// TestForward_FastCommandsGetTheirRequestReply fences a race that only
+// showed up on *quick* commands. The client blocks on the reply to its exec
+// request; the upstream can finish the command, send exit-status, and close
+// the channel in well under a millisecond. If teardown closes the client
+// channel while that reply is still in flight, the client's Start fails
+// with a bare EOF and the command silently never runs.
+//
+// One round reproduces it only sometimes, so this runs enough rounds to
+// make the window very likely to be hit at least once.
+func TestForward_FastCommandsGetTheirRequestReply(t *testing.T) {
+	upstream := newTestUpstream(t)
+	addr, _ := startForwarderBastion(t, upstream)
+
+	client := dialBastion(t, addr)
+	defer client.Close()
+
+	const rounds = 60
+	for i := range rounds {
+		sess, err := client.NewSession()
+		if err != nil {
+			t.Fatalf("round %d: NewSession: %v", i, err)
+		}
+
+		// Start and Wait are checked separately: the race kills the exec
+		// request specifically, and Output would blur which one failed.
+		if err := sess.Start("echo hello"); err != nil {
+			_ = sess.Close()
+			t.Fatalf("round %d: exec request failed: %v\n"+
+				"the reply to an in-flight client request was dropped by teardown", i, err)
+		}
+		if err := sess.Wait(); err != nil {
+			_ = sess.Close()
+			t.Fatalf("round %d: Wait: %v", i, err)
+		}
+		_ = sess.Close()
+	}
+}
