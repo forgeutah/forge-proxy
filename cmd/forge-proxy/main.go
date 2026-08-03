@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/forgeutah/forge-proxy/internal/auth"
 	"github.com/forgeutah/forge-proxy/internal/config"
@@ -27,6 +29,10 @@ import (
 	"github.com/forgeutah/forge-proxy/internal/httplog"
 	"github.com/forgeutah/forge-proxy/internal/proxy"
 	"github.com/forgeutah/forge-proxy/internal/session"
+	"github.com/forgeutah/forge-proxy/internal/sshca"
+	"github.com/forgeutah/forge-proxy/internal/sshenroll"
+	"github.com/forgeutah/forge-proxy/internal/sshkey"
+	"github.com/forgeutah/forge-proxy/internal/sshproxy"
 	"github.com/forgeutah/forge-proxy/internal/user"
 	"github.com/forgeutah/forge-proxy/internal/web"
 )
@@ -46,11 +52,11 @@ func main() {
 	// exists for ad-hoc invocations and for hosts that don't use systemd.
 	args := os.Args[1:]
 	var (
-		envFile  string
-		daemon   bool
-		pidFile  string
-		logFile  string
-		err      error
+		envFile string
+		daemon  bool
+		pidFile string
+		logFile string
+		err     error
 	)
 	args, envFile, err = extractEnvFileFlag(args)
 	if err != nil {
@@ -164,11 +170,11 @@ func rebuildChildArgs(envFile string, remaining []string) []string {
 // Operators who want a different layout can set --env-file explicitly or
 // override via the FORGE_PROXY_ENV_FILE env var (handled below).
 var defaultEnvFileCandidates = []string{
-	"$FORGE_PROXY_ENV_FILE",          // explicit operator override
-	"/etc/forge-proxy.env",           // system-wide install (preferred)
+	"$FORGE_PROXY_ENV_FILE",            // explicit operator override
+	"/etc/forge-proxy.env",             // system-wide install (preferred)
 	"$XDG_CONFIG_HOME/forge-proxy.env", // XDG-style user config
-	"$HOME/.config/forge-proxy.env",  // legacy user config fallback
-	"./forge-proxy.env",              // CWD (development convenience)
+	"$HOME/.config/forge-proxy.env",    // legacy user config fallback
+	"./forge-proxy.env",                // CWD (development convenience)
 }
 
 // defaultEnvFilePath returns the first existing path from
@@ -330,6 +336,22 @@ func run() error {
 		CallbackLimiter: callbackLimiter,
 	})
 
+	// SSH subsystem (optional). Everything below is skipped when
+	// SSH_UPSTREAMS is empty, so an HTTP-only deployment loads no keys,
+	// binds no extra listeners, and mounts no extra routes.
+	sshKeys := sshkey.New(database, nil)
+	sshSrv, sshEnrollH, err := buildSSHSubsystem(cfg, sshKeys, users, sessions)
+	if err != nil {
+		return err
+	}
+	if sshEnrollH != nil {
+		// Enrollment runs on the auth host because it completes through the
+		// existing Slack OIDC flow.
+		sshEnrollH.Mount(authMux)
+	}
+
+	// The web handler owns "/" and must be registered after the more
+	// specific routes above.
 	webH := web.NewHandler()
 	authMux.Handle("GET /", webH)
 
@@ -377,6 +399,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Start the SSH listeners alongside the HTTP server. Run returns when
+	// its context is cancelled or a listener fails to bind.
+	sshCtx, sshStop := context.WithCancel(context.Background())
+	defer sshStop()
+	var sshWG sync.WaitGroup
+	sshErrCh := make(chan error, 1)
+	if sshSrv != nil {
+		sshWG.Go(func() {
+			if err := sshSrv.Run(sshCtx); err != nil {
+				sshErrCh <- err
+			}
+		})
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("forge-proxy listening", "addr", cfg.ListenAddr)
@@ -391,12 +427,37 @@ func run() error {
 		slog.Info("shutdown signal received")
 	case err := <-errCh:
 		return err
+	case err := <-sshErrCh:
+		// A listener that cannot bind is fatal: the operator asked for
+		// those ports and silently serving without them would look
+		// healthy while half the service is missing.
+		return fmt.Errorf("ssh subsystem: %w", err)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
+	}
+
+	// SSH closes after HTTP and before the sweeper and DB: live SSH
+	// sessions hold user lookups, so tearing the stores out from under
+	// them first would produce errors on the way down.
+	//
+	// SSH sessions cannot drain gracefully -- an interactive shell or a
+	// VSCode Remote SSH connection has no natural stopping point -- so
+	// this is a bounded force-close rather than a wait for quiet.
+	if sshSrv != nil {
+		sshStop()
+		sshShutdownCtx, sshCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := sshSrv.Shutdown(sshShutdownCtx); err != nil {
+			// Log and keep going: the remaining shutdown steps still
+			// need to run, and the process is exiting regardless.
+			slog.Warn("ssh shutdown incomplete", "error", err.Error())
+		}
+		sshCancel()
+		sshWG.Wait()
+		slog.Info("ssh subsystem stopped")
 	}
 
 	// Stop the sweeper and wait for it to exit before letting the
@@ -413,6 +474,76 @@ func run() error {
 // stdout with level driven by cfg.LogLevel. The LevelVar wrapper allows
 // future runtime level changes (e.g. via SIGHUP) without reconstructing
 // the handler.
+// buildSSHSubsystem constructs the SSH bastion when SSH_UPSTREAMS is
+// configured. Returns (nil, nil, nil) when the subsystem is disabled, so
+// the HTTP-only path costs nothing.
+//
+// Every failure here is fatal rather than degraded: an operator who
+// configured SSH upstreams and got a running binary would reasonably
+// assume SSH works, and a proxy that silently skipped host-key
+// verification would be worse than one that refused to start.
+func buildSSHSubsystem(
+	cfg *config.Config,
+	keys *sshkey.Store,
+	users *user.Store,
+	sessions *session.Store,
+) (*sshproxy.Server, *sshenroll.Handlers, error) {
+	if len(cfg.SSHUpstreams) == 0 {
+		return nil, nil, nil
+	}
+
+	hostKey, err := sshca.LoadOrGenerate(cfg.SSHHostKeyPath, slog.Default())
+	if err != nil {
+		return nil, nil, fmt.Errorf("ssh host key: %w", err)
+	}
+	caKey, err := sshca.LoadOrGenerate(cfg.SSHCAKeyPath, slog.Default())
+	if err != nil {
+		return nil, nil, fmt.Errorf("ssh ca key: %w", err)
+	}
+
+	// Publish the CA public key at startup: the operator has to copy this
+	// into every upstream's TrustedUserCAKeys, and hunting for it on disk
+	// inside a container is needless friction.
+	slog.Info("ssh_ca_public_key",
+		"authorized_key", strings.TrimSpace(string(ssh.MarshalAuthorizedKey(caKey.PublicKey()))),
+		"path", cfg.SSHCAKeyPath)
+
+	// known_hosts is required. Without it the outbound proxy-to-upstream
+	// leg would be trust-on-first-use, which defeats the point of
+	// verifying the upstream at all.
+	hostKeyCallback, err := knownhosts.New(cfg.SSHKnownHostsPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"ssh known_hosts %q: %w\n\npopulate it with `ssh-keyscan -p <port> <host> >> %s` "+
+				"for every upstream host:port in SSH_UPSTREAMS",
+			cfg.SSHKnownHostsPath, err, cfg.SSHKnownHostsPath)
+	}
+
+	tokens := sshenroll.NewStore(nil)
+	enrollH := sshenroll.New(tokens, sessions, users, keys, cfg.AuthHost)
+
+	upstreams := make(map[int]sshproxy.Upstream, len(cfg.SSHUpstreams))
+	for port, up := range cfg.SSHUpstreams {
+		upstreams[port] = sshproxy.Upstream{
+			Port:         up.Port,
+			Target:       up.Target,
+			AllowedRoles: up.AllowedRoles,
+		}
+	}
+
+	forwarder := sshproxy.NewForwarder(caKey, hostKeyCallback, slog.Default())
+	srv := sshproxy.New(sshproxy.Config{
+		ListenAddr:         cfg.SSHListenAddr,
+		Upstreams:          upstreams,
+		HostKey:            hostKey,
+		CAKey:              caKey,
+		KnownHostsCallback: hostKeyCallback,
+		AuthHost:           cfg.AuthHost,
+	}, keys, users, enrollH, forwarder, slog.Default())
+
+	return srv, enrollH, nil
+}
+
 func setupLogging(logLevel string) {
 	level := new(slog.LevelVar)
 	switch strings.ToLower(strings.TrimSpace(logLevel)) {

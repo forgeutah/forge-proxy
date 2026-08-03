@@ -25,6 +25,7 @@ import (
 	"github.com/forgeutah/forge-proxy/internal/config"
 	"github.com/forgeutah/forge-proxy/internal/db"
 	"github.com/forgeutah/forge-proxy/internal/session"
+	"github.com/forgeutah/forge-proxy/internal/sshkey"
 	"github.com/forgeutah/forge-proxy/internal/user"
 )
 
@@ -36,6 +37,7 @@ type adminEnv struct {
 	database *db.DB
 	users    *user.Store
 	sessions *session.Store
+	keys     *sshkey.Store
 	stdout   io.Writer
 }
 
@@ -46,7 +48,7 @@ type adminEnv struct {
 // $u; done`).
 func runAdmin(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: forge-proxy admin <subcommand> [args...]\n\nsubcommands:\n  list-users [--match <substring>]\n  set-roles <email> <comma-roles>\n  force-logout <email>\n  force-logout-all")
+		return fmt.Errorf("usage: forge-proxy admin <subcommand> [args...]\n\nsubcommands:\n  list-users [--match <substring>]\n  set-roles <email> <comma-roles>\n  force-logout <email>\n  force-logout-all\n  ssh-list-keys <email>\n  ssh-remove-key <fingerprint>\n  ssh-force-logout <email>")
 	}
 
 	// Build the env up front: every subcommand needs config + DB + stores.
@@ -77,6 +79,12 @@ func dispatchAdmin(env *adminEnv, args []string) error {
 		return adminForceLogout(env, rest)
 	case "force-logout-all":
 		return adminForceLogoutAll(env, rest)
+	case "ssh-list-keys":
+		return adminSSHListKeys(env, rest)
+	case "ssh-remove-key":
+		return adminSSHRemoveKey(env, rest)
+	case "ssh-force-logout":
+		return adminSSHForceLogout(env, rest)
 	default:
 		return fmt.Errorf("unknown subcommand %q", sub)
 	}
@@ -105,6 +113,7 @@ func newAdminEnv(stdout io.Writer) (*adminEnv, func(), error) {
 			IdleTimeout:  cfg.SessionIdleTimeout,
 			CookieDomain: cfg.CookieDomain,
 		}),
+		keys:   sshkey.New(database, nil),
 		stdout: stdout,
 	}
 	cleanup := func() { _ = database.Close() }
@@ -274,4 +283,130 @@ func classifyBusy(err error) error {
 		return fmt.Errorf("the database write lock is held by the running server; retry in a few seconds: %w", err)
 	}
 	return err
+}
+
+// --- SSH key administration ---------------------------------------------
+
+// adminSSHListKeys prints every SSH public key registered to the named user.
+// Same tab-separated shape as list-users so the two compose in the same
+// pipelines.
+func adminSSHListKeys(env *adminEnv, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: forge-proxy admin ssh-list-keys <email>")
+	}
+	email := strings.TrimSpace(args[0])
+	if email == "" {
+		return fmt.Errorf("ssh-list-keys: email is required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	u, err := env.users.GetByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, user.ErrNotFound) {
+			return fmt.Errorf("ssh-list-keys: no user with email %q (try `forge-proxy admin list-users --match %s`)", email, strings.Split(email, "@")[0])
+		}
+		return classifyBusy(err)
+	}
+
+	keys, err := env.keys.ListByUser(ctx, u.ID)
+	if err != nil {
+		return classifyBusy(err)
+	}
+
+	// Header prints even when there are no keys, so an operator can tell
+	// "no keys registered" apart from "command did nothing".
+	fmt.Fprintln(env.stdout, "id\tfingerprint\tkey_type\tlabel\tcreated_at\tlast_used_at")
+	for _, k := range keys {
+		fmt.Fprintf(env.stdout, "%d\t%s\t%s\t%s\t%s\t%s\n",
+			k.ID, k.Fingerprint, k.KeyType, k.Label,
+			k.CreatedAt.UTC().Format(time.RFC3339),
+			formatLastUsed(k.LastUsedAt))
+	}
+	return nil
+}
+
+// formatLastUsed renders a never-used key's zero timestamp as "never"
+// rather than year 1, which reads as corruption in a terminal.
+func formatLastUsed(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// adminSSHRemoveKey deletes one key by fingerprint. Idempotent: removing a
+// fingerprint that is not registered is a no-op that exits zero, mirroring
+// force-logout, so off-boarding scripts can run twice without failing.
+func adminSSHRemoveKey(env *adminEnv, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: forge-proxy admin ssh-remove-key <fingerprint>\n\nlist fingerprints with `forge-proxy admin ssh-list-keys <email>`")
+	}
+	fingerprint := strings.TrimSpace(args[0])
+	if fingerprint == "" {
+		return fmt.Errorf("ssh-remove-key: fingerprint is required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	k, err := env.keys.Get(ctx, fingerprint)
+	if err != nil {
+		if errors.Is(err, sshkey.ErrNotFound) {
+			fmt.Fprintf(env.stdout, "ssh-remove-key: no key with fingerprint %q; nothing to do\n", fingerprint)
+			return nil
+		}
+		return classifyBusy(err)
+	}
+
+	if err := env.keys.Remove(ctx, fingerprint); err != nil {
+		if errors.Is(err, sshkey.ErrNotFound) {
+			fmt.Fprintf(env.stdout, "ssh-remove-key: no key with fingerprint %q; nothing to do\n", fingerprint)
+			return nil
+		}
+		return classifyBusy(err)
+	}
+	fmt.Fprintf(env.stdout, "removed key %s (id=%d, user_id=%d)\n", fingerprint, k.ID, k.UserID)
+	return nil
+}
+
+// adminSSHForceLogout reports why it cannot do what its name suggests.
+//
+// The live-session registry is in-memory inside the running server process,
+// and admin subcommands run as a *separate* process against the same SQLite
+// file. There is no IPC between them, so this command can never reach the
+// sessions it would need to close. Rather than print "closed 0 sessions" and
+// exit zero -- which reads as "there were none" and would let an operator
+// believe an off-boarding completed -- it fails loudly and names the two
+// things that do work.
+func adminSSHForceLogout(env *adminEnv, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: forge-proxy admin ssh-force-logout <email>")
+	}
+	email := strings.TrimSpace(args[0])
+	if email == "" {
+		return fmt.Errorf("ssh-force-logout: email is required")
+	}
+
+	// Resolve the user anyway: a typo'd email should surface as a typo,
+	// not as the process-boundary message.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	u, err := env.users.GetByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, user.ErrNotFound) {
+			return fmt.Errorf("ssh-force-logout: no user with email %q", email)
+		}
+		return classifyBusy(err)
+	}
+
+	return fmt.Errorf(
+		"ssh-force-logout: cannot close live SSH sessions for %s (id=%d) from a separate process.\n\n"+
+			"Active SSH sessions live in the running server's memory, and this command runs as its own\n"+
+			"process, so it has no way to reach them.\n\n"+
+			"To revoke SSH access:\n"+
+			"  1. forge-proxy admin ssh-list-keys %s\n"+
+			"  2. forge-proxy admin ssh-remove-key <fingerprint>   # blocks all future connections\n"+
+			"  3. restart forge-proxy to drop sessions that are still open",
+		u.Email, u.ID, u.Email)
 }

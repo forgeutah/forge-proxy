@@ -33,3 +33,12 @@ type ProxySecret string
 
 // LogValue implements slog.LogValuer.
 func (ProxySecret) LogValue() slog.Value { return slog.StringValue("[REDACTED]") }
+
+// SSHEnrollmentToken redacts enrollment-token values in slog output. The
+// token is bound to an offered SSH key fingerprint with a 10-minute TTL;
+// anyone with it can complete the OIDC round-trip and bind the key to
+// whichever user signs in. Keep it out of log lines.
+type SSHEnrollmentToken string
+
+// LogValue implements slog.LogValuer.
+func (SSHEnrollmentToken) LogValue() slog.Value { return slog.StringValue("[REDACTED]") }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/forgeutah/forge-proxy/internal/db"
 	"github.com/forgeutah/forge-proxy/internal/session"
+	"github.com/forgeutah/forge-proxy/internal/sshkey"
 	"github.com/forgeutah/forge-proxy/internal/user"
 )
 
@@ -36,6 +37,7 @@ func newAdminTestEnv(t *testing.T) (*adminEnv, *bytes.Buffer) {
 			Lifetime:    30 * 24 * time.Hour,
 			IdleTimeout: 14 * 24 * time.Hour,
 		}),
+		keys:   sshkey.New(database, nil),
 		stdout: stdout,
 	}
 	return env, stdout
@@ -290,5 +292,164 @@ func TestAdmin_ParseRolesArg(t *testing.T) {
 				t.Errorf("parseRolesArg(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
 			}
 		}
+	}
+}
+
+// --- SSH key administration ---------------------------------------------
+
+// seedKey registers an SSH key for a user, mirroring what the enrollment
+// flow writes.
+func seedKey(t *testing.T, env *adminEnv, userID int64, fingerprint, label string) *sshkey.Key {
+	t.Helper()
+	k, err := env.keys.Add(context.Background(), userID, fingerprint,
+		"ssh-ed25519", []byte("public-key-bytes"), label)
+	if err != nil {
+		t.Fatalf("keys.Add(%s): %v", fingerprint, err)
+	}
+	return k
+}
+
+func TestAdmin_SSHListKeys_ShowsEveryRegisteredKey(t *testing.T) {
+	env, stdout := newAdminTestEnv(t)
+	u := seedUser(t, env, "U1", "alice@example.com", "Alice")
+	seedKey(t, env, u.ID, "SHA256:aaa", "laptop")
+	seedKey(t, env, u.ID, "SHA256:bbb", "desktop")
+
+	if err := dispatchAdmin(env, []string{"ssh-list-keys", "alice@example.com"}); err != nil {
+		t.Fatalf("ssh-list-keys: %v", err)
+	}
+
+	out := stdout.String()
+	for _, want := range []string{"fingerprint", "SHA256:aaa", "SHA256:bbb", "laptop", "desktop"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	// Header + two keys.
+	if got := len(strings.Split(strings.TrimSpace(out), "\n")); got != 3 {
+		t.Errorf("line count = %d, want 3 (header + 2 keys):\n%s", got, out)
+	}
+}
+
+func TestAdmin_SSHListKeys_NeverUsedKeyReadsAsNever(t *testing.T) {
+	env, stdout := newAdminTestEnv(t)
+	u := seedUser(t, env, "U1", "alice@example.com", "Alice")
+	seedKey(t, env, u.ID, "SHA256:aaa", "laptop")
+
+	if err := dispatchAdmin(env, []string{"ssh-list-keys", "alice@example.com"}); err != nil {
+		t.Fatalf("ssh-list-keys: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "never") {
+		t.Errorf("a never-used key should read as \"never\", not a zero timestamp:\n%s", stdout.String())
+	}
+}
+
+func TestAdmin_SSHListKeys_NoKeysPrintsHeaderOnly(t *testing.T) {
+	env, stdout := newAdminTestEnv(t)
+	seedUser(t, env, "U1", "alice@example.com", "Alice")
+
+	if err := dispatchAdmin(env, []string{"ssh-list-keys", "alice@example.com"}); err != nil {
+		t.Fatalf("ssh-list-keys: %v", err)
+	}
+	if got := strings.TrimSpace(stdout.String()); !strings.HasPrefix(got, "id\tfingerprint") ||
+		len(strings.Split(got, "\n")) != 1 {
+		t.Errorf("want header line only, got:\n%s", got)
+	}
+}
+
+func TestAdmin_SSHListKeys_NonexistentEmailErrors(t *testing.T) {
+	env, _ := newAdminTestEnv(t)
+	err := dispatchAdmin(env, []string{"ssh-list-keys", "nobody@example.com"})
+	if err == nil {
+		t.Fatal("expected an error for an unknown email")
+	}
+	if !strings.Contains(err.Error(), "no user with email") {
+		t.Errorf("error = %v, want a user-not-found message", err)
+	}
+}
+
+func TestAdmin_SSHRemoveKey_RemovesOnlyThatKey(t *testing.T) {
+	env, stdout := newAdminTestEnv(t)
+	u := seedUser(t, env, "U1", "alice@example.com", "Alice")
+	seedKey(t, env, u.ID, "SHA256:aaa", "laptop")
+	seedKey(t, env, u.ID, "SHA256:bbb", "desktop")
+
+	if err := dispatchAdmin(env, []string{"ssh-remove-key", "SHA256:aaa"}); err != nil {
+		t.Fatalf("ssh-remove-key: %v", err)
+	}
+	stdout.Reset()
+	if err := dispatchAdmin(env, []string{"ssh-list-keys", "alice@example.com"}); err != nil {
+		t.Fatalf("ssh-list-keys: %v", err)
+	}
+	out := stdout.String()
+	if strings.Contains(out, "SHA256:aaa") {
+		t.Errorf("removed key still listed:\n%s", out)
+	}
+	if !strings.Contains(out, "SHA256:bbb") {
+		t.Errorf("the other key was removed too:\n%s", out)
+	}
+}
+
+// TestAdmin_SSHRemoveKey_UnknownFingerprintIsIdempotent keeps off-boarding
+// scripts re-runnable: removing a key that is already gone must not fail.
+func TestAdmin_SSHRemoveKey_UnknownFingerprintIsIdempotent(t *testing.T) {
+	env, stdout := newAdminTestEnv(t)
+	if err := dispatchAdmin(env, []string{"ssh-remove-key", "SHA256:nonexistent"}); err != nil {
+		t.Fatalf("removing an unknown fingerprint should succeed, got: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "nothing to do") {
+		t.Errorf("output should say the key was already absent:\n%s", stdout.String())
+	}
+}
+
+// TestAdmin_SSHForceLogout_ExplainsProcessBoundary pins the deliberate
+// behavior: admin runs in its own process and cannot reach the running
+// server's in-memory session registry, so the command must fail loudly
+// rather than report zero sessions closed as success.
+func TestAdmin_SSHForceLogout_ExplainsProcessBoundary(t *testing.T) {
+	env, _ := newAdminTestEnv(t)
+	seedUser(t, env, "U1", "alice@example.com", "Alice")
+
+	err := dispatchAdmin(env, []string{"ssh-force-logout", "alice@example.com"})
+	if err == nil {
+		t.Fatal("expected a non-nil error; reporting success would let an operator " +
+			"believe live sessions were closed when they were not")
+	}
+	for _, want := range []string{"separate process", "ssh-remove-key", "restart"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got:\n%v", want, err)
+		}
+	}
+}
+
+func TestAdmin_SSHForceLogout_NonexistentEmailErrorsAsTypo(t *testing.T) {
+	env, _ := newAdminTestEnv(t)
+	err := dispatchAdmin(env, []string{"ssh-force-logout", "nobody@example.com"})
+	if err == nil {
+		t.Fatal("expected an error for an unknown email")
+	}
+	if !strings.Contains(err.Error(), "no user with email") {
+		t.Errorf("an unknown email should surface as a typo, not the process-boundary "+
+			"message; got:\n%v", err)
+	}
+}
+
+func TestAdmin_SSHSubcommands_UsageErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"ssh-list-keys no args", []string{"ssh-list-keys"}},
+		{"ssh-list-keys too many args", []string{"ssh-list-keys", "a@b.c", "extra"}},
+		{"ssh-remove-key no args", []string{"ssh-remove-key"}},
+		{"ssh-force-logout no args", []string{"ssh-force-logout"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _ := newAdminTestEnv(t)
+			if err := dispatchAdmin(env, tc.args); err == nil {
+				t.Error("expected a usage error")
+			}
+		})
 	}
 }
