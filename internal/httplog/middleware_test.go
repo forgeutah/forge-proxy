@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -309,3 +310,106 @@ func TestRateLimit_RefillsOverTime(t *testing.T) {
 // match. Demonstrates the canonical chain order for documentation
 // purposes; not strictly necessary but useful as an example.
 var _ = fmt.Sprintf
+
+// TestAccessLogMiddleware_SupportsProtocolUpgrade is the regression fence for
+// WebSockets through the access log.
+//
+// statusRecorder embeds http.ResponseWriter, which gives it only that
+// interface's method set — so it silently stopped satisfying http.Hijacker
+// even though the writer underneath satisfied it. httputil.ReverseProxy
+// type-asserts http.Hijacker before switching protocols, so every WebSocket
+// handshake through this middleware failed with a 502 and
+// "can't switch protocols using non-Hijacker ResponseWriter type".
+//
+// This drives a real upgrade over a real connection rather than asserting on
+// the interface, because the interface assertion is exactly the thing that
+// was wrong: a compile-time check would have passed on the broken code too
+// (the embedded interface makes any assertion compile).
+func TestAccessLogMiddleware_SupportsProtocolUpgrade(t *testing.T) {
+	buf := newCapturingLogger(t)
+
+	handler := RequestIDMiddleware(AccessLogMiddleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				// Mirror the exact failure ReverseProxy hits.
+				http.Error(w, fmt.Sprintf("non-Hijacker ResponseWriter type %T", w), http.StatusBadGateway)
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("Hijack: %v", err)
+				return
+			}
+			defer conn.Close()
+			_, _ = buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+			_, _ = buf.WriteString("hello-over-hijacked-conn")
+			_ = buf.Flush()
+		})))
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	_, _ = fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	resp := string(got)
+
+	if !strings.Contains(resp, "101 Switching Protocols") {
+		t.Fatalf("upgrade failed; response was:\n%s", resp)
+	}
+	if !strings.Contains(resp, "hello-over-hijacked-conn") {
+		t.Errorf("post-upgrade payload missing; response was:\n%s", resp)
+	}
+
+	// The access log must report the upgrade, not the 200 the recorder
+	// starts at — an operator reading 200 for a hijacked request would be
+	// looking at a status that never went on the wire.
+	//
+	// The log line is emitted after the handler returns, which races the
+	// client's read finishing when the hijacked conn closes; poll briefly
+	// rather than sleeping a fixed amount.
+	var logged string
+	for i := 0; i < 100; i++ {
+		if logged = buf.String(); strings.Contains(logged, `"status":`) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(logged, `"status":101`) {
+		t.Errorf("access log should record status 101 for a hijacked request; got:\n%s", logged)
+	}
+}
+
+// TestStatusRecorder_ForwardsFlush pins that streaming reaches the client
+// incrementally. proxy.go sets FlushInterval = -1 for SSE and chunked
+// upstreams; that setting is inert unless this wrapper forwards Flush.
+func TestStatusRecorder_ForwardsFlush(t *testing.T) {
+	flushed := false
+	rec := &statusRecorder{ResponseWriter: flushSpy{ResponseWriter: httptest.NewRecorder(), onFlush: func() { flushed = true }}, status: http.StatusOK}
+
+	f, ok := any(rec).(http.Flusher)
+	if !ok {
+		t.Fatal("statusRecorder does not implement http.Flusher; FlushInterval=-1 in the proxy has nothing to call")
+	}
+	f.Flush()
+	if !flushed {
+		t.Error("Flush did not reach the underlying ResponseWriter")
+	}
+}
+
+type flushSpy struct {
+	http.ResponseWriter
+	onFlush func()
+}
+
+func (f flushSpy) Flush() { f.onFlush() }

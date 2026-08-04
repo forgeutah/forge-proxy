@@ -1,9 +1,11 @@
 package httplog
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -106,6 +108,54 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	s.bytes += n
 	return n, err
 }
+
+// Hijack forwards to the underlying ResponseWriter so protocol upgrades
+// (WebSocket) work through this middleware.
+//
+// This is not optional plumbing. Embedding http.ResponseWriter gives this
+// type only the interface's method set, so *statusRecorder does not satisfy
+// http.Hijacker even when the writer underneath does. httputil.ReverseProxy
+// type-asserts http.Hijacker before switching protocols and fails the
+// request when the assertion misses:
+//
+//	can't switch protocols using non-Hijacker ResponseWriter type *httplog.statusRecorder
+//
+// which surfaces to the browser as a 502 on every WebSocket handshake.
+//
+// After a successful hijack the caller owns the connection and writes to it
+// directly, so neither Write nor WriteHeader runs again. Record 101 here so
+// the access log reports the upgrade instead of the misleading 200 the
+// recorder was initialised with; bytes stay at whatever was written before
+// the hijack, since post-hijack traffic is invisible to this layer.
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := s.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("httplog: underlying %T does not implement http.Hijacker", s.ResponseWriter)
+	}
+	s.status = http.StatusSwitchingProtocols
+	return hj.Hijack()
+}
+
+// Flush forwards to the underlying ResponseWriter so streaming responses
+// reach the client as they are produced.
+//
+// Same method-set problem as Hijack: without this, *statusRecorder does not
+// satisfy http.Flusher, and the proxy's FlushInterval = -1 ("flush after
+// every write", chosen precisely for SSE and chunked upstreams) has nothing
+// to call. Streaming still completes, but the client receives it buffered
+// rather than incrementally, which is invisible in tests and obvious to a
+// user watching a live log or token stream.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap exposes the wrapped writer to http.ResponseController, which is how
+// newer standard-library code reaches Flush/SetWriteDeadline through
+// middleware wrappers. Keeps this recorder transparent to that path as well
+// as to the direct type assertions above.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // AccessLogMiddleware emits one structured log line per request at request
 // end. Fields: method, path, status, duration_ms, bytes_out, remote_addr,
